@@ -78,11 +78,13 @@ class PolarQuant:
 
 
 def _generate_rotation_matrix(dim: int, seed: int) -> mx.array:
-    """Generate Haar-distributed random orthogonal matrix via QR."""
-    rng = np.random.RandomState(seed)
-    gaussian = rng.randn(dim, dim).astype(np.float32)
-    q, r = np.linalg.qr(gaussian)
-    d = np.diag(r)
-    ph = np.sign(d)
-    q *= ph[np.newaxis, :]
-    return mx.array(q)
+    """Generate Haar-distributed random orthogonal matrix via QR.
+
+    Uses mx.linalg.qr to match rachittshah's turboquant.py (PR #1059).
+    """
+    key = mx.random.key(seed)
+    g = mx.random.normal(shape=(dim, dim), key=key)
+    q, r = mx.linalg.qr(g, stream=mx.cpu)
+    sign = mx.sign(mx.diag(r))
+    sign = mx.where(sign == 0, 1, sign)
+    return q * sign

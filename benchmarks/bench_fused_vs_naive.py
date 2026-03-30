@@ -30,6 +30,9 @@ def bench_naive(queries, keys_raw, values_raw, bits, n_trials=5, warmup=2):
     """Benchmark naive dequantize-then-matmul path."""
     D = queries.shape[-1]
     scale = 1.0 / math.sqrt(D)
+    n_heads = queries.shape[1]
+    n_kv_heads = keys_raw.shape[1]
+    rep = n_heads // n_kv_heads
     pq_key = PolarQuant(bits=bits, dim=D, seed=42)
     pq_val = PolarQuant(bits=bits, dim=D, seed=43)
 
@@ -40,6 +43,9 @@ def bench_naive(queries, keys_raw, values_raw, bits, n_trials=5, warmup=2):
     for _ in range(warmup):
         keys_deq = pq_key.dequantize(k_indices, k_norms)
         values_deq = pq_val.dequantize(v_indices, v_norms)
+        if rep > 1:
+            keys_deq = mx.repeat(keys_deq, rep, axis=1)
+            values_deq = mx.repeat(values_deq, rep, axis=1)
         scores = (queries @ mx.swapaxes(keys_deq, -2, -1)) * scale
         weights = mx.softmax(scores, axis=-1, precise=True)
         output = weights @ values_deq
@@ -50,6 +56,9 @@ def bench_naive(queries, keys_raw, values_raw, bits, n_trials=5, warmup=2):
         t0 = time.perf_counter()
         keys_deq = pq_key.dequantize(k_indices, k_norms)
         values_deq = pq_val.dequantize(v_indices, v_norms)
+        if rep > 1:
+            keys_deq = mx.repeat(keys_deq, rep, axis=1)
+            values_deq = mx.repeat(values_deq, rep, axis=1)
         scores = (queries @ mx.swapaxes(keys_deq, -2, -1)) * scale
         weights = mx.softmax(scores, axis=-1, precise=True)
         output = weights @ values_deq
@@ -85,20 +94,31 @@ def bench_fp16_baseline(queries, keys_raw, values_raw, n_trials=5, warmup=2):
     """Benchmark uncompressed FP16 baseline (no quantization at all)."""
     D = queries.shape[-1]
     scale = 1.0 / math.sqrt(D)
+    n_heads = queries.shape[1]
+    n_kv_heads = keys_raw.shape[1]
+    rep = n_heads // n_kv_heads
+
+    # Expand KV heads for GQA
+    if rep > 1:
+        keys_exp = mx.repeat(keys_raw, rep, axis=1)
+        values_exp = mx.repeat(values_raw, rep, axis=1)
+    else:
+        keys_exp = keys_raw
+        values_exp = values_raw
 
     # Warmup
     for _ in range(warmup):
-        scores = (queries @ mx.swapaxes(keys_raw, -2, -1)) * scale
+        scores = (queries @ mx.swapaxes(keys_exp, -2, -1)) * scale
         weights = mx.softmax(scores, axis=-1, precise=True)
-        output = weights @ values_raw
+        output = weights @ values_exp
         mx.eval(output)
 
     times = []
     for _ in range(n_trials):
         t0 = time.perf_counter()
-        scores = (queries @ mx.swapaxes(keys_raw, -2, -1)) * scale
+        scores = (queries @ mx.swapaxes(keys_exp, -2, -1)) * scale
         weights = mx.softmax(scores, axis=-1, precise=True)
-        output = weights @ values_raw
+        output = weights @ values_exp
         mx.eval(output)
         times.append(time.perf_counter() - t0)
 
