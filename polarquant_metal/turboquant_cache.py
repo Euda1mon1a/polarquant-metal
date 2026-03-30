@@ -122,8 +122,18 @@ class TurboQuantKVCache:
         self._v_norms[..., prev:prev + S, :] = v_norms
         self.offset += S
 
-        # Return dequantized for compatibility with standard attention path.
-        # When using fused_sdpa(), callers can ignore these return values.
+        if self._fused:
+            # Fused path: skip dequantization entirely.
+            # Return lightweight views that won't be used — the patched SDPA
+            # calls cache.fused_sdpa() which reads packed storage directly.
+            # We return the packed arrays so the return value isn't None
+            # (some model code checks `keys is not None`).
+            return (
+                self._k_packed[..., :self.offset, :],
+                self._v_packed[..., :self.offset, :],
+            )
+
+        # Standard path: dequantize for compatibility
         all_k = self._key_pq.dequantize(
             self._unpack_keys(), self._k_norms[..., :self.offset, :]
         )

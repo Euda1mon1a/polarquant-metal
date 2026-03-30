@@ -24,27 +24,40 @@ from polarquant_metal.turboquant_cache import TurboQuantKVCache
 def test_basic_update_fetch():
     """Test that update_and_fetch works and returns correct shapes."""
     for bits in [2, 3, 4]:
+        # Fused mode: returns packed arrays
         cache = TurboQuantKVCache(bits=bits, fused=True)
         assert cache.empty()
 
         k = mx.random.normal(shape=(1, 8, 16, 128))
         v = mx.random.normal(shape=(1, 8, 16, 128))
-        dk, dv = cache.update_and_fetch(k, v)
-        mx.eval(dk, dv)
+        ret_k, ret_v = cache.update_and_fetch(k, v)
+        mx.eval(ret_k, ret_v)
 
         assert cache.size() == 16
-        assert dk.shape == (1, 8, 16, 128)
-        assert dv.shape == (1, 8, 16, 128)
+        assert not cache.empty()
+        assert ret_k.dtype == mx.uint32  # packed indices, not float
 
         # Decode step
         k2 = mx.random.normal(shape=(1, 8, 1, 128))
         v2 = mx.random.normal(shape=(1, 8, 1, 128))
-        dk2, dv2 = cache.update_and_fetch(k2, v2)
-        mx.eval(dk2, dv2)
+        cache.update_and_fetch(k2, v2)
 
         assert cache.size() == 17
-        assert dk2.shape == (1, 8, 17, 128)
-        print(f"  {bits}-bit: shapes OK, offset={cache.size()}")
+
+        # fused_sdpa should work
+        q = mx.random.normal(shape=(1, 8, 1, 128))
+        out = cache.fused_sdpa(q)
+        mx.eval(out)
+        assert out.shape == (1, 8, 1, 128)
+        print(f"  {bits}-bit: fused OK, offset={cache.size()}")
+
+        # Non-fused mode: returns dequantized floats
+        cache_deq = TurboQuantKVCache(bits=bits, fused=False)
+        dk, dv = cache_deq.update_and_fetch(k, v)
+        mx.eval(dk, dv)
+        assert dk.shape == (1, 8, 16, 128)
+        assert dk.dtype != mx.uint32
+        print(f"  {bits}-bit: dequant OK")
 
     print("PASS: test_basic_update_fetch")
 
@@ -61,12 +74,11 @@ def test_fused_vs_dequantized():
     keys = mx.array(np.random.randn(B, n_kv_heads, L_kv, D).astype(np.float32))
     values = mx.array(np.random.randn(B, n_kv_heads, L_kv, D).astype(np.float32))
 
-    # Dequantized path
-    cache_deq = TurboQuantKVCache(bits=bits, fused=True)
+    # Dequantized reference path (fused=False)
+    cache_deq = TurboQuantKVCache(bits=bits, fused=False)
     dk, dv = cache_deq.update_and_fetch(keys, values)
     mx.eval(dk, dv)
 
-    # Expand for GQA
     dk_exp = mx.repeat(dk, rep, axis=1)
     dv_exp = mx.repeat(dv, rep, axis=1)
     scores_ref = (queries @ mx.swapaxes(dk_exp, -2, -1)) * scale
@@ -74,11 +86,12 @@ def test_fused_vs_dequantized():
     out_ref = weights_ref @ dv_exp
     mx.eval(out_ref)
 
-    # Fused path (reuse same cache — data already stored)
-    out_fused = cache_deq.fused_sdpa(queries, scale=scale)
+    # Fused path (fused=True)
+    cache_fused = TurboQuantKVCache(bits=bits, fused=True)
+    cache_fused.update_and_fetch(keys, values)  # returns packed, ignored
+    out_fused = cache_fused.fused_sdpa(queries, scale=scale)
     mx.eval(out_fused)
 
-    # Compare
     cos_sim = float(mx.mean(
         mx.sum(out_ref * out_fused, axis=-1) /
         (mx.linalg.norm(out_ref, axis=-1) * mx.linalg.norm(out_fused, axis=-1) + 1e-8)
@@ -157,7 +170,7 @@ def test_quality_vs_fp16():
 
 
 def test_decode_speed():
-    """Benchmark decode speed: fused vs dequantized."""
+    """Benchmark decode speed: fused (no dequant) vs full dequantized path."""
     B, n_heads, n_kv_heads, L_kv, D = 1, 32, 8, 1024, 128
     bits = 3
     rep = n_heads // n_kv_heads
@@ -167,24 +180,30 @@ def test_decode_speed():
     values = mx.random.normal(shape=(B, n_kv_heads, L_kv, D))
     queries = mx.random.normal(shape=(B, n_heads, 1, D))
 
-    cache = TurboQuantKVCache(bits=bits, fused=True)
-    dk, dv = cache.update_and_fetch(keys, values)
+    # Fused cache (skips dequant in update_and_fetch)
+    cache_fused = TurboQuantKVCache(bits=bits, fused=True)
+    cache_fused.update_and_fetch(keys, values)
+    mx.eval(cache_fused._k_packed)
+
+    # Dequantized cache
+    cache_deq = TurboQuantKVCache(bits=bits, fused=False)
+    dk, dv = cache_deq.update_and_fetch(keys, values)
     mx.eval(dk, dv)
 
-    # Warmup
+    # Warmup fused
     for _ in range(3):
-        out = cache.fused_sdpa(queries, scale=scale)
+        out = cache_fused.fused_sdpa(queries, scale=scale)
         mx.eval(out)
 
-    # Fused
+    # Bench fused
     fused_times = []
     for _ in range(10):
         t0 = time.perf_counter()
-        out = cache.fused_sdpa(queries, scale=scale)
+        out = cache_fused.fused_sdpa(queries, scale=scale)
         mx.eval(out)
         fused_times.append(time.perf_counter() - t0)
 
-    # Dequantized
+    # Warmup dequantized
     for _ in range(3):
         dk_exp = mx.repeat(dk, rep, axis=1)
         dv_exp = mx.repeat(dv, rep, axis=1)
@@ -193,6 +212,7 @@ def test_decode_speed():
         o = w @ dv_exp
         mx.eval(o)
 
+    # Bench dequantized
     deq_times = []
     for _ in range(10):
         t0 = time.perf_counter()
@@ -253,6 +273,42 @@ def test_state_save_restore():
     print("PASS: test_state_save_restore")
 
 
+def test_sdpa_patch():
+    """Test that patched SDPA correctly dispatches to fused path."""
+    from polarquant_metal.integration import patch_sdpa, unpatch_sdpa
+    import mlx_lm.models.base as base_module
+
+    B, n_heads, n_kv_heads, L_kv, D = 1, 8, 4, 32, 64
+    scale = 1.0 / math.sqrt(D)
+
+    keys = mx.random.normal(shape=(B, n_kv_heads, L_kv, D))
+    values = mx.random.normal(shape=(B, n_kv_heads, L_kv, D))
+    queries = mx.random.normal(shape=(B, n_heads, 1, D))
+
+    # Fused cache
+    cache = TurboQuantKVCache(bits=3, fused=True)
+    ret_k, ret_v = cache.update_and_fetch(keys, values)
+
+    # Reference: direct fused_sdpa call
+    out_direct = cache.fused_sdpa(queries, scale=scale)
+    mx.eval(out_direct)
+
+    # Patch SDPA and call through it
+    patch_sdpa()
+    out_patched = base_module.scaled_dot_product_attention(
+        queries, ret_k, ret_v, cache=cache, scale=scale, mask=None,
+    )
+    mx.eval(out_patched)
+
+    # Should be identical (same code path)
+    max_diff = float(mx.max(mx.abs(out_direct - out_patched)))
+    print(f"  Patched SDPA vs direct fused_sdpa: max_diff={max_diff:.6e}")
+    assert max_diff < 1e-6, f"Patched SDPA diverges: {max_diff}"
+
+    unpatch_sdpa()
+    print("PASS: test_sdpa_patch")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("TurboQuantKVCache + Fused Metal Kernel Integration Tests")
@@ -271,6 +327,8 @@ if __name__ == "__main__":
     test_trim()
     print()
     test_state_save_restore()
+    print()
+    test_sdpa_patch()
 
     print()
     print("=" * 60)
