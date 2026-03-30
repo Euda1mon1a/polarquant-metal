@@ -29,11 +29,15 @@ from .codebooks import load_codebook_f32
 from .kernels import polarquant_qk_matmul, polarquant_sv_matmul
 
 
-def _create_attention_mask(h, offset, dtype=mx.float32):
+def _create_causal_mask(N, offset=0, window_size=None):
     """Create causal attention mask compatible with mlx-lm."""
-    rinds = mx.arange(offset - h.shape[2], offset)
-    linds = mx.arange(offset, offset + h.shape[2])
-    mask = linds[:, None] >= rinds[None]
+    rinds = mx.arange(offset + N)
+    linds = mx.arange(offset, offset + N) if offset else rinds
+    linds = linds[:, None]
+    rinds = rinds[None]
+    mask = linds >= rinds
+    if window_size is not None:
+        mask = mask & (linds < rinds + window_size)
     return mask
 
 
@@ -312,8 +316,12 @@ class TurboQuantKVCache:
         if head_dim > 0:
             self._init(head_dim)
 
-    def make_mask(self, *args, **kwargs):
-        return _create_attention_mask(*args, offset=self.offset, **kwargs)
+    def make_mask(self, N, return_array=False, window_size=None):
+        if N == 1:
+            return None
+        if return_array or (window_size and N > window_size):
+            return _create_causal_mask(N, offset=self.offset, window_size=window_size)
+        return "causal"
 
     @property
     def nbytes(self):
