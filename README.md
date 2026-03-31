@@ -62,13 +62,28 @@ output = cache.fused_attention(queries)
 ## Integration with mlx-lm
 
 ```python
-from mlx_lm import load
+import mlx_lm
 from polarquant_metal.integration import make_fused_cache
 
-model, tokenizer = load("mlx-community/Llama-3.2-3B-Instruct-4bit")
+model, tokenizer = mlx_lm.load("mlx-community/Qwen3.5-35B-A3B-4bit")
 cache = make_fused_cache(model, bits=3)
-# Now use cache with standard mlx-lm generate
+response = mlx_lm.generate(model, tokenizer, prompt="...", prompt_cache=cache)
 ```
+
+### How it works
+
+`make_fused_cache()` handles everything automatically:
+- **Hybrid models** (Qwen3.5): detects `is_linear` layers, uses `ArraysCache` for linear attention and `TurboQuantKVCache` for standard attention
+- **Lazy quantization**: stores FP16 until `min_fused_context` (default 512 tokens), then bulk-quantizes. Zero overhead for short conversations.
+- **SDPA dispatch**: prefill (L_q > 1) uses standard FP16 attention. Decode (L_q == 1) uses fused Metal kernels after threshold.
+
+### Performance (Qwen3.5-35B-A3B-4bit, M4 Pro)
+
+| Context | Speed vs Standard | Memory |
+|---------|------------------|--------|
+| <512 tokens | 1.0x (identical) | FP16 |
+| 600+ tokens | 0.97x | 4.6x compressed |
+| Decode at 2K | 2.0x vs naive dequant | 4.6x compressed |
 
 ## Integration with mlx-turboquant
 
@@ -144,11 +159,13 @@ acc *= norms[k_idx] * scale;  // apply key norm + attention scale
 
 ## Limitations
 
-1. **No QJL residual correction yet** — this kernel handles Stage 1 (PolarQuant) only. Adding QJL would require an additional correction term in the Q@K^T kernel.
+1. **Prefill is slow** — the per-element kernel can't parallelize across L_q > 1. Prefill falls back to standard FP16 SDPA automatically. Fused kernels only benefit decode (L_q=1).
 
-2. **Not yet simdgroup-optimized** — the current kernel is per-element. A simdgroup-tiled version that loads query tiles into shared memory would improve throughput significantly for longer contexts.
+2. **No QJL residual correction** — handles Stage 1 (PolarQuant) only. Adding QJL would require an additional correction term in the Q@K^T kernel.
 
-3. **Pack/unpack uses numpy** — the initial packing of indices goes through numpy. A Metal kernel for packing would eliminate this CPU roundtrip.
+3. **Model-dependent quality** — Llama-3.2-3B and Qwen3.5-35B produce correct output. Phi-4-Mini degrades (PolarQuant itself produces low cosine similarity on this architecture — same issue in upstream PR #1059).
+
+4. **SV kernel is the bottleneck** — 47% of time at 2K tokens. Tiled SV and simd_broadcast_first were both tested and found slower than the simple per-element kernel (Metal L1 cache handles broadcast efficiently). Pre-combined weight*norm optimization gives 25% improvement.
 
 ## License
 
