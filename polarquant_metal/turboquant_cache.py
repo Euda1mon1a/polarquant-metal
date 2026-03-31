@@ -55,13 +55,15 @@ class TurboQuantKVCache:
 
     step = 256
 
-    def __init__(self, bits: int = 3, fused: bool = True, min_fused_context: int = 512):
+    def __init__(self, bits: int = 3, fused: bool = True, min_fused_context: int = 512,
+                 sparse_v_threshold: float = 1e-3):
         if bits not in (2, 3, 4):
             raise ValueError(f"bits must be 2, 3, or 4, got {bits}")
         self.turbo_bits = bits
         self.offset = 0
         self._fused = fused
         self.min_fused_context = min_fused_context
+        self.sparse_v_threshold = sparse_v_threshold
 
         self._head_dim = None
         self._key_pq = None
@@ -237,7 +239,7 @@ class TurboQuantKVCache:
         # Softmax
         weights = mx.softmax(scores, axis=-1, precise=True)
 
-        # Fused weights @ V (output in rotated value basis)
+        # Fused weights @ V with Sparse V (skip near-zero weight positions)
         out_rotated = polarquant_sv_matmul(
             weights=weights,
             v_indices=v_packed,
@@ -245,6 +247,7 @@ class TurboQuantKVCache:
             v_centroids=self._value_centroids_f32,
             head_dim=self._head_dim,
             bits=self.turbo_bits,
+            sparse_v_threshold=self.sparse_v_threshold,
         )
 
         # Inverse rotation from value basis

@@ -293,11 +293,18 @@ _SV_PRECOMBINED_SOURCE = """
     uint wn_base = ((b_idx * n_heads + h_idx) * L_q + q_idx) * L_kv;
     uint vi_base = ((b_idx * n_kv_heads + kv_h_idx) * L_kv) * D_packed;
 
+    // Sparse V threshold: skip positions where weight*norm is negligible.
+    // After softmax, most attention is concentrated on a few positions.
+    // Skipping near-zero weights avoids the codebook lookup + multiply.
+    float sv_thresh = sparse_thresh[0];
+
     float acc = 0.0f;
     for (uint k = 0; k < L_kv; k++) {
         float wn_val = float(wn_combined[wn_base + k]);
-        uint idx = unpack_index<BITS>(&v_indices[vi_base + k * D_packed], d_idx);
-        acc += wn_val * float(v_centroids[idx]);
+        if (wn_val > sv_thresh || wn_val < -sv_thresh) {
+            uint idx = unpack_index<BITS>(&v_indices[vi_base + k * D_packed], d_idx);
+            acc += wn_val * float(v_centroids[idx]);
+        }
     }
 
     out[elem] = T(acc);
@@ -305,10 +312,11 @@ _SV_PRECOMBINED_SOURCE = """
 
 
 def _build_sv_precombined_kernel(bits: int):
-    """Build the optimized SV kernel taking pre-combined weight*norm."""
+    """Build the optimized SV kernel with Sparse V threshold."""
     return mx.fast.metal_kernel(
         name=f"polarquant_sv_pre_{bits}bit",
-        input_names=["wn_combined", "v_indices", "v_centroids", "actual_dim"],
+        input_names=["wn_combined", "v_indices", "v_centroids", "actual_dim",
+                      "sparse_thresh"],
         output_names=["out"],
         header=_QK_KERNEL_HEADER,
         source=_SV_PRECOMBINED_SOURCE,
@@ -408,6 +416,7 @@ def polarquant_sv_matmul(
     head_dim: int,
     bits: int = 3,
     precombine: bool = True,
+    sparse_v_threshold: float = 0.0,
 ) -> mx.array:
     """Fused PolarQuant softmax(scores) @ V matmul.
 
@@ -422,6 +431,8 @@ def polarquant_sv_matmul(
         head_dim:   actual head dimension D (before packing)
         bits:       quantization bits (2, 3, or 4)
         precombine: pre-multiply weight*norm on host (default True, ~25% faster)
+        sparse_v_threshold: skip V positions where |weight*norm| < threshold.
+            0.0 disables (default). Try 1e-4 to 1e-3 for speedup at long contexts.
 
     Returns:
         output: (B, n_heads, L_q, D) attention output
@@ -433,6 +444,7 @@ def polarquant_sv_matmul(
     out_shape = (B, n_heads, L_q, head_dim)
     total_elements = int(np.prod(out_shape))
     actual_dim_arr = mx.array([head_dim], dtype=mx.uint32)
+    thresh_arr = mx.array([sparse_v_threshold], dtype=mx.float32)
 
     if precombine:
         rep = n_heads // n_kv_heads
@@ -448,7 +460,7 @@ def polarquant_sv_matmul(
         kernel = _sv_pre_kernels[bits]
 
         outputs = kernel(
-            inputs=[wn, v_indices, v_centroids, actual_dim_arr],
+            inputs=[wn, v_indices, v_centroids, actual_dim_arr, thresh_arr],
             template=[("T", weights.dtype), ("BITS", bits)],
             output_shapes=[out_shape],
             output_dtypes=[weights.dtype],
