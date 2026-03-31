@@ -157,6 +157,28 @@ acc *= norms[k_idx] * scale;  // apply key norm + attention scale
 - GQA: fully supported (n_heads != n_kv_heads)
 - Dtypes: float32, float16, bfloat16
 
+## MLX Server Integration (LIVE)
+
+PolarQuant is deployed on the OpenClaw MLX server (Qwen3.5-35B-A3B-4bit on port 8080).
+
+### Setup
+
+1. Install in server venv: `~/.mlx-server-env/bin/pip install -e ~/workspace/polarquant-metal/`
+2. Patch `~/.mlx-server-env/.../app/models/mlx_vlm.py` — add PolarQuant cache creation in `MLX_VLM.__call__` (env-var gated)
+3. Add `POLARQUANT_KV=1` to `~/Library/LaunchAgents/ai.mlx.server.plist` EnvironmentVariables
+4. Restart: `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/ai.mlx.server.plist && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.mlx.server.plist`
+
+### Key details
+
+- **Model**: `mlx-community/Qwen3.5-35B-A3B-4bit` loaded via `mlx_vlm` (not `mlx_lm`)
+- **Cache target**: `model.language_model` (the text decoder within the VLM wrapper)
+- **SDPA patching**: Must scan both `mlx_lm.models.*` AND `mlx_vlm.models.*` — VLM models import SDPA from `mlx_lm.models.base` but store copied references in VLM module namespace
+- **Rollback**: Set `POLARQUANT_KV=0` in plist, restart. Backups at `~/.openclaw/backups/*.pre-polarquant`
+
+### Client impact
+
+None. Koa's text-router sends standard OpenAI-compatible requests. PolarQuant is entirely server-side.
+
 ## Limitations
 
 1. **Prefill is slow** — the per-element kernel can't parallelize across L_q > 1. Prefill falls back to standard FP16 SDPA automatically. Fused kernels only benefit decode (L_q=1).
