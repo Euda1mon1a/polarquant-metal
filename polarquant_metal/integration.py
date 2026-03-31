@@ -78,8 +78,31 @@ def unpatch_sdpa():
     _original_sdpa = None
 
 
+def adaptive_threshold(default: int = 512, context_file: str = None) -> int:
+    """Return a context-aware lazy quantization threshold.
+
+    For long-running sessions (>30 min), compress earlier (256 tokens).
+    For quick queries, stay FP16 longer (default 512).
+    Reads session duration from OpenClaw context.json if available.
+    """
+    if context_file is None:
+        context_file = os.path.expanduser("~/.openclaw/state/context.json")
+    try:
+        import json
+        with open(context_file) as f:
+            ctx = json.load(f)
+        # If session has been running >30 min, compress earlier
+        session_minutes = ctx.get("session", {}).get("duration_minutes", 0)
+        if session_minutes > 30:
+            return 256
+    except Exception:
+        pass
+    return default
+
+
 def make_fused_cache(model, bits: int = 3, bits_v: int = None,
-                     boundary_layers: int = 2) -> list:
+                     boundary_layers: int = 2,
+                     min_fused_context: int = 512) -> list:
     """Create cache instances for each layer and patch SDPA.
 
     For hybrid models (e.g. Qwen3.5) that mix standard and linear attention,
@@ -122,5 +145,6 @@ def make_fused_cache(model, bits: int = 3, bits_v: int = None,
         elif i in boundary_set:
             caches.append(KVCache())
         else:
-            caches.append(TurboQuantKVCache(bits=bits, bits_v=bits_v, fused=True))
+            caches.append(TurboQuantKVCache(bits=bits, bits_v=bits_v, fused=True,
+                                            min_fused_context=min_fused_context))
     return caches
