@@ -43,6 +43,11 @@ def patch_sdpa():
             L_q = queries.shape[2]
             if L_q == 1 and cache.offset >= cache.min_fused_context:
                 return cache.fused_sdpa(queries, scale=scale, mask=mask)
+            # During prefill (L_q > 1) with quantized cache, update_and_fetch
+            # returns packed stubs. Dequantize for standard SDPA.
+            if cache._quantized:
+                keys = cache.keys
+                values = cache.values
 
         # Fall through to original (handles prefill, short context, standard)
         return _original_sdpa(
@@ -52,8 +57,9 @@ def patch_sdpa():
     base_module.scaled_dot_product_attention = _patched_sdpa
 
     # Also patch any already-imported model modules that copied the reference
+    # Scan both mlx_lm and mlx_vlm modules (VLM models import SDPA from mlx_lm.models.base)
     for name, mod in list(sys.modules.items()):
-        if name.startswith("mlx_lm.models.") and mod is not None:
+        if (name.startswith("mlx_lm.models.") or name.startswith("mlx_vlm.models.")) and mod is not None:
             if hasattr(mod, "scaled_dot_product_attention"):
                 if mod.scaled_dot_product_attention is _original_sdpa:
                     mod.scaled_dot_product_attention = _patched_sdpa
@@ -69,7 +75,7 @@ def unpatch_sdpa():
     base_module.scaled_dot_product_attention = _original_sdpa
 
     for name, mod in list(sys.modules.items()):
-        if name.startswith("mlx_lm.models.") and mod is not None:
+        if (name.startswith("mlx_lm.models.") or name.startswith("mlx_vlm.models.")) and mod is not None:
             if hasattr(mod, "scaled_dot_product_attention"):
                 # Only restore if it's our patched version
                 if mod.scaled_dot_product_attention is not _original_sdpa:

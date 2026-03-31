@@ -128,6 +128,12 @@ class TurboQuantKVCache:
 
             if self.offset >= self.min_fused_context:
                 self._bulk_quantize()
+                # After bulk quantize, fp16 storage is freed — return packed
+                # stubs so patched SDPA routes to fused_sdpa()
+                return (
+                    self._k_packed[..., :self.offset, :],
+                    self._v_packed[..., :self.offset, :],
+                )
 
             return self._fp16_keys, self._fp16_values
 
@@ -271,7 +277,7 @@ class TurboQuantKVCache:
         from .packing import unpack_indices
         return unpack_indices(
             self._v_packed[..., :self.offset, :],
-            self.turbo_bits, self._head_dim,
+            self._bits_v, self._head_dim,
         )
 
     def _expand(self, B, n_kv_heads, new_tokens, dtype, packed_dim):
