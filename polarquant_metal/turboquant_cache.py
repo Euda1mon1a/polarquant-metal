@@ -55,18 +55,24 @@ class TurboQuantKVCache:
 
     step = 256
 
-    def __init__(self, bits: int = 3, fused: bool = True):
+    def __init__(self, bits: int = 3, fused: bool = True, min_fused_context: int = 512):
         if bits not in (2, 3, 4):
             raise ValueError(f"bits must be 2, 3, or 4, got {bits}")
         self.turbo_bits = bits
         self.offset = 0
         self._fused = fused
+        self.min_fused_context = min_fused_context
 
         self._head_dim = None
         self._key_pq = None
         self._value_pq = None
+        self._quantized = not fused  # fused=False always quantizes; fused=True defers
 
-        # Packed storage
+        # FP16 storage (used below min_fused_context)
+        self._fp16_keys = None
+        self._fp16_values = None
+
+        # Packed storage (used at/above min_fused_context)
         self._k_packed = None
         self._k_norms = None
         self._v_packed = None
@@ -87,39 +93,52 @@ class TurboQuantKVCache:
             self._value_centroids_f32 = load_codebook_f32(self.turbo_bits, head_dim)
 
     def update_and_fetch(self, keys, values):
-        """Compress and store new KV entries.
+        """Store new KV entries. Uses FP16 until context reaches threshold,
+        then bulk-quantizes and switches to PolarQuant compressed storage.
 
-        Returns dequantized (keys, values) for compatibility with mlx-lm's
-        standard attention path. The compressed data is stored internally
-        for use by fused_sdpa().
+        Below min_fused_context: zero overhead (stores/returns FP16 like KVCache).
+        At/above threshold: compressed storage + fused Metal kernel decode.
 
         Args:
             keys: (B, n_kv_heads, S, D) new key vectors
             values: (B, n_kv_heads, S, D) new value vectors
 
         Returns:
-            (all_keys_deq, all_values_deq): dequantized full cache contents
+            (all_keys, all_values): FP16 or packed arrays depending on mode
         """
         B, n_kv_heads, S, D = keys.shape
-        prev = self.offset
 
         if self._key_pq is None:
             self._init(D)
 
-        # Quantize
+        if not self._quantized and self._fused:
+            # Lazy mode (fused=True only): store FP16 until threshold
+            if self._fp16_keys is None:
+                self._fp16_keys = keys
+                self._fp16_values = values
+            else:
+                self._fp16_keys = mx.concatenate(
+                    [self._fp16_keys, keys], axis=2)
+                self._fp16_values = mx.concatenate(
+                    [self._fp16_values, values], axis=2)
+            self.offset += S
+
+            if self.offset >= self.min_fused_context:
+                self._bulk_quantize()
+
+            return self._fp16_keys, self._fp16_values
+
+        # Quantized mode: compress and store
+        prev = self.offset
         k_idx, k_norms = self._key_pq.quantize(keys)
         v_idx, v_norms = self._value_pq.quantize(values)
-
-        # Pack
         k_packed = pack_indices(k_idx, self.turbo_bits)
         v_packed = pack_indices(v_idx, self.turbo_bits)
 
-        # Expand storage if needed
         needed = prev + S
         if self._k_packed is None or needed > self._k_packed.shape[2]:
             self._expand(B, n_kv_heads, S, keys.dtype, k_packed.shape[-1])
 
-        # Store
         self._k_packed[..., prev:prev + S, :] = k_packed
         self._k_norms[..., prev:prev + S, :] = k_norms
         self._v_packed[..., prev:prev + S, :] = v_packed
@@ -127,17 +146,13 @@ class TurboQuantKVCache:
         self.offset += S
 
         if self._fused:
-            # Fused path: skip dequantization entirely.
-            # Return lightweight views that won't be used — the patched SDPA
-            # calls cache.fused_sdpa() which reads packed storage directly.
-            # We return the packed arrays so the return value isn't None
-            # (some model code checks `keys is not None`).
+            # Return packed stubs — SDPA patch uses fused_sdpa
             return (
                 self._k_packed[..., :self.offset, :],
                 self._v_packed[..., :self.offset, :],
             )
 
-        # Standard path: dequantize for compatibility
+        # Non-fused: return dequantized arrays for standard SDPA
         all_k = self._key_pq.dequantize(
             self._unpack_keys(), self._k_norms[..., :self.offset, :]
         )
@@ -145,6 +160,28 @@ class TurboQuantKVCache:
             self._unpack_values(), self._v_norms[..., :self.offset, :]
         )
         return all_k, all_v
+
+    def _bulk_quantize(self):
+        """Convert accumulated FP16 cache to PolarQuant compressed format."""
+        B, n_kv_heads, L, D = self._fp16_keys.shape
+
+        k_idx, k_norms = self._key_pq.quantize(self._fp16_keys)
+        v_idx, v_norms = self._value_pq.quantize(self._fp16_values)
+        k_packed = pack_indices(k_idx, self.turbo_bits)
+        v_packed = pack_indices(v_idx, self.turbo_bits)
+
+        # Allocate packed storage
+        self._expand(B, n_kv_heads, L, self._fp16_keys.dtype,
+                     k_packed.shape[-1])
+        self._k_packed[..., :L, :] = k_packed
+        self._k_norms[..., :L, :] = k_norms
+        self._v_packed[..., :L, :] = v_packed
+        self._v_norms[..., :L, :] = v_norms
+
+        # Free FP16 storage
+        self._fp16_keys = None
+        self._fp16_values = None
+        self._quantized = True
 
     def fused_sdpa(self, queries, scale=None, mask=None):
         """Compute full attention using fused Metal kernels.
@@ -162,8 +199,10 @@ class TurboQuantKVCache:
         """
         if not self._fused:
             raise RuntimeError("fused_sdpa requires fused=True")
-        if self._k_packed is None or self.offset == 0:
+        if self.offset == 0:
             raise RuntimeError("Cache is empty — call update_and_fetch first")
+        if not self._quantized:
+            self._bulk_quantize()
 
         B, n_heads, L_q, D = queries.shape
         if scale is None:
@@ -260,16 +299,20 @@ class TurboQuantKVCache:
 
     @property
     def keys(self):
-        if self._k_packed is None or self.offset == 0:
+        if self.offset == 0:
             return None
+        if not self._quantized:
+            return self._fp16_keys
         return self._key_pq.dequantize(
             self._unpack_keys(), self._k_norms[..., :self.offset, :]
         )
 
     @property
     def values(self):
-        if self._v_packed is None or self.offset == 0:
+        if self.offset == 0:
             return None
+        if not self._quantized:
+            return self._fp16_values
         return self._value_pq.dequantize(
             self._unpack_values(), self._v_norms[..., :self.offset, :]
         )
@@ -278,7 +321,7 @@ class TurboQuantKVCache:
         return self.offset
 
     def empty(self):
-        return self._k_packed is None or self.offset == 0
+        return self.offset == 0
 
     def is_trimmable(self):
         return True
@@ -290,8 +333,10 @@ class TurboQuantKVCache:
 
     @property
     def state(self):
-        if self._k_packed is None:
+        if self.offset == 0:
             return []
+        if not self._quantized:
+            return [self._fp16_keys, self._fp16_values]
         return [
             self._k_packed[..., :self.offset, :],
             self._k_norms[..., :self.offset, :],
@@ -302,8 +347,15 @@ class TurboQuantKVCache:
     @state.setter
     def state(self, v):
         if v is not None and v:
-            self._k_packed, self._k_norms, self._v_packed, self._v_norms = v
-            self.offset = self._k_packed.shape[2]
+            if len(v) == 2:
+                # FP16 mode
+                self._fp16_keys, self._fp16_values = v
+                self.offset = self._fp16_keys.shape[2]
+                self._quantized = False
+            else:
+                self._k_packed, self._k_norms, self._v_packed, self._v_norms = v
+                self.offset = self._k_packed.shape[2]
+                self._quantized = True
 
     @property
     def meta_state(self):

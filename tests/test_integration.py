@@ -24,7 +24,7 @@ from polarquant_metal.turboquant_cache import TurboQuantKVCache
 def test_basic_update_fetch():
     """Test that update_and_fetch works and returns correct shapes."""
     for bits in [2, 3, 4]:
-        # Fused mode: returns packed arrays
+        # Fused mode: always returns dequantized arrays (for prefill compat)
         cache = TurboQuantKVCache(bits=bits, fused=True)
         assert cache.empty()
 
@@ -35,7 +35,7 @@ def test_basic_update_fetch():
 
         assert cache.size() == 16
         assert not cache.empty()
-        assert ret_k.dtype == mx.uint32  # packed indices, not float
+        assert ret_k.shape == (1, 8, 16, 128)  # dequantized, full shape
 
         # Decode step
         k2 = mx.random.normal(shape=(1, 8, 1, 128))
@@ -285,8 +285,8 @@ def test_sdpa_patch():
     values = mx.random.normal(shape=(B, n_kv_heads, L_kv, D))
     queries = mx.random.normal(shape=(B, n_heads, 1, D))
 
-    # Fused cache
-    cache = TurboQuantKVCache(bits=3, fused=True)
+    # Fused cache with min_fused_context=0 to force immediate quantization
+    cache = TurboQuantKVCache(bits=3, fused=True, min_fused_context=0)
     ret_k, ret_v = cache.update_and_fetch(keys, values)
 
     # Reference: direct fused_sdpa call

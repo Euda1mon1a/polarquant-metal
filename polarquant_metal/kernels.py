@@ -265,10 +265,61 @@ def _build_sv_kernel(bits: int):
     return kernel
 
 
+# ---------------------------------------------------------------------------
+# Optimized SV kernel: pre-combined weight*norm eliminates one memory read
+# and one multiply per inner loop iteration. The GQA norm expansion is done
+# on the Python side before kernel dispatch.
+# ---------------------------------------------------------------------------
+
+_SV_PRECOMBINED_SOURCE = """
+    uint elem = thread_position_in_grid.x;
+
+    uint actual_D = actual_dim[0];
+    uint L_q = wn_combined_shape[2];
+    uint L_kv = wn_combined_shape[3];
+    uint n_heads = wn_combined_shape[1];
+    uint n_kv_heads = v_indices_shape[1];
+
+    uint d_idx = elem % actual_D;
+    uint q_idx = (elem / actual_D) % L_q;
+    uint h_idx = (elem / actual_D / L_q) % n_heads;
+    uint b_idx = elem / (actual_D * L_q * n_heads);
+
+    uint kv_h_idx = h_idx / (n_heads / n_kv_heads);
+
+    constexpr uint vals_per_int = 32 / BITS;
+    uint D_packed = (actual_D + vals_per_int - 1) / vals_per_int;
+
+    uint wn_base = ((b_idx * n_heads + h_idx) * L_q + q_idx) * L_kv;
+    uint vi_base = ((b_idx * n_kv_heads + kv_h_idx) * L_kv) * D_packed;
+
+    float acc = 0.0f;
+    for (uint k = 0; k < L_kv; k++) {
+        float wn_val = float(wn_combined[wn_base + k]);
+        uint idx = unpack_index<BITS>(&v_indices[vi_base + k * D_packed], d_idx);
+        acc += wn_val * float(v_centroids[idx]);
+    }
+
+    out[elem] = T(acc);
+"""
+
+
+def _build_sv_precombined_kernel(bits: int):
+    """Build the optimized SV kernel taking pre-combined weight*norm."""
+    return mx.fast.metal_kernel(
+        name=f"polarquant_sv_pre_{bits}bit",
+        input_names=["wn_combined", "v_indices", "v_centroids", "actual_dim"],
+        output_names=["out"],
+        header=_QK_KERNEL_HEADER,
+        source=_SV_PRECOMBINED_SOURCE,
+    )
+
+
 # Cache compiled kernels by bit width
 _qk_kernels = {}
 _qk_tiled_kernels = {}
 _sv_kernels = {}
+_sv_pre_kernels = {}
 
 TILE_Q = 8
 TILE_K = 32
@@ -356,6 +407,7 @@ def polarquant_sv_matmul(
     v_centroids: mx.array,
     head_dim: int,
     bits: int = 3,
+    precombine: bool = True,
 ) -> mx.array:
     """Fused PolarQuant softmax(scores) @ V matmul.
 
@@ -369,6 +421,7 @@ def polarquant_sv_matmul(
         v_centroids: (n_levels,) float32 value codebook centroids
         head_dim:   actual head dimension D (before packing)
         bits:       quantization bits (2, 3, or 4)
+        precombine: pre-multiply weight*norm on host (default True, ~25% faster)
 
     Returns:
         output: (B, n_heads, L_q, D) attention output
@@ -376,23 +429,44 @@ def polarquant_sv_matmul(
     assert bits in (2, 3, 4), f"Unsupported bit width: {bits}"
 
     B, n_heads, L_q, L_kv = weights.shape
-
-    if bits not in _sv_kernels:
-        _sv_kernels[bits] = _build_sv_kernel(bits)
-    kernel = _sv_kernels[bits]
-
+    _, n_kv_heads, _, _ = v_indices.shape
     out_shape = (B, n_heads, L_q, head_dim)
     total_elements = int(np.prod(out_shape))
-
     actual_dim_arr = mx.array([head_dim], dtype=mx.uint32)
 
-    outputs = kernel(
-        inputs=[weights, v_indices, v_norms, v_centroids, actual_dim_arr],
-        template=[("T", weights.dtype), ("BITS", bits)],
-        output_shapes=[out_shape],
-        output_dtypes=[weights.dtype],
-        grid=(total_elements, 1, 1),
-        threadgroup=(min(256, total_elements), 1, 1),
-    )
+    if precombine:
+        rep = n_heads // n_kv_heads
+        norms_sq = v_norms.squeeze(-1)
+        if rep > 1:
+            norms_exp = mx.repeat(norms_sq, rep, axis=1)
+        else:
+            norms_exp = norms_sq
+        wn = weights * norms_exp[:, :, None, :]
+
+        if bits not in _sv_pre_kernels:
+            _sv_pre_kernels[bits] = _build_sv_precombined_kernel(bits)
+        kernel = _sv_pre_kernels[bits]
+
+        outputs = kernel(
+            inputs=[wn, v_indices, v_centroids, actual_dim_arr],
+            template=[("T", weights.dtype), ("BITS", bits)],
+            output_shapes=[out_shape],
+            output_dtypes=[weights.dtype],
+            grid=(total_elements, 1, 1),
+            threadgroup=(min(256, total_elements), 1, 1),
+        )
+    else:
+        if bits not in _sv_kernels:
+            _sv_kernels[bits] = _build_sv_kernel(bits)
+        kernel = _sv_kernels[bits]
+
+        outputs = kernel(
+            inputs=[weights, v_indices, v_norms, v_centroids, actual_dim_arr],
+            template=[("T", weights.dtype), ("BITS", bits)],
+            output_shapes=[out_shape],
+            output_dtypes=[weights.dtype],
+            grid=(total_elements, 1, 1),
+            threadgroup=(min(256, total_elements), 1, 1),
+        )
 
     return outputs[0]

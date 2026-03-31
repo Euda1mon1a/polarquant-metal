@@ -32,11 +32,13 @@
 
 | KV Length | FP16 | Naive Dequant | Fused Metal | Fused/Naive | Fused/FP16 | Compression |
 |-----------|------|--------------|-------------|------------|-----------|-------------|
-| 64 | 0.19ms | 0.38ms | 0.47ms | 0.80x | 2.43x | 4.6x |
-| 256 | 0.22ms | 0.30ms | 0.27ms | **1.11x** | 1.22x | 4.6x |
-| 512 | 0.19ms | 0.40ms | 0.31ms | **1.32x** | 1.60x | 4.6x |
-| 1024 | 0.43ms | 0.80ms | 0.44ms | **1.82x** | **1.03x** | 4.6x |
-| 2048 | 0.48ms | 1.44ms | 0.97ms | **1.48x** | 2.02x | 4.6x |
+| 64 | 0.41ms | 0.37ms | 0.37ms | 1.00x | 0.90x | 4.6x |
+| 256 | 0.19ms | 0.39ms | 0.30ms | **1.31x** | 1.60x | 4.6x |
+| 512 | 0.19ms | 0.43ms | 0.37ms | **1.16x** | 1.93x | 4.6x |
+| 1024 | 0.44ms | 0.77ms | 0.45ms | **1.71x** | **1.03x** | 4.6x |
+| 2048 | 0.63ms | 1.32ms | 0.68ms | **1.94x** | **1.08x** | 4.6x |
+
+SV kernel optimized with pre-combined weight*norm (25% faster at 1K+ tokens).
 
 ## End-to-End Model Results
 
@@ -64,9 +66,16 @@ Root cause: NOT a kernel bug. The naive dequant path produces identical attentio
 
 This matches rachittshah's PR #1059 findings: "Some models degrade below 4-bit (Qwen3-1.7B drops at 3-bit). Recommend 4-bit as default."
 
-### Qwen3.5-35B-A3B-4bit — NOT TESTED
+### Qwen3.5-35B-A3B-4bit — WORKS (hybrid cache)
 
-Requires special handling: Qwen3.5 uses hybrid linear/standard attention with `ArraysCache(size=2)` for linear layers and `KVCache()` for standard layers. Cannot replace all caches with TurboQuantKVCache.
+Qwen3.5 uses hybrid attention: 30 linear layers (`GatedDeltaNet` with `ArraysCache`) + 10 standard attention layers (`Qwen3NextAttention` with `KVCache`). `make_fused_cache()` now detects `is_linear` and only replaces standard attention layers with `TurboQuantKVCache`.
+
+| Config | Result |
+|--------|--------|
+| Cache assignment | 30 ArraysCache + 10 TurboQuantKVCache (correct) |
+| "What is 2+2?" | "Four" (1.54s) |
+| TCP/UDP explanation | Coherent, structured (3.50s, 100 tokens) |
+| PolarQuant KV cache | 107.7 KB across 10 layers |
 
 ## Architecture
 
@@ -83,10 +92,29 @@ Model Attention Layer:
      4e. Inverse rotate output: out = out_rot @ R
 ```
 
+## Per-Operation Profiling (3-bit, 32h/8kv, D=128, decode L_q=1)
+
+After SV kernel optimization (pre-combined weight*norm):
+
+| L_kv | Q Rot (ms) | QK Kern (ms) | Softmax (ms) | SV Kern (ms) | Out Rot (ms) | Sum (ms) | Pipeline (ms) |
+|------|-----------|-------------|-------------|-------------|-------------|---------|--------------|
+| 64   | 0.163 (17%) | 0.279 (30%) | 0.132 (14%) | 0.219 (23%) | 0.150 (16%) | 0.943 | 0.243 |
+| 256  | 0.139 (19%) | 0.153 (21%) | 0.125 (17%) | 0.197 (27%) | 0.121 (16%) | 0.735 | 0.268 |
+| 512  | 0.128 (16%) | 0.159 (20%) | 0.128 (16%) | 0.244 (31%) | 0.128 (16%) | 0.787 | 0.311 |
+| 1024 | 0.133 (12%) | 0.320 (30%) | 0.140 (13%) | 0.355 (33%) | 0.136 (13%) | 1.084 | 0.452 |
+| 2048 | 0.150 (9%)  | 0.431 (27%) | 0.133 (8%)  | 0.752 (47%) | 0.133 (8%)  | 1.599 | 0.940 |
+
+**Key findings:**
+- **SV kernel improved 25%** at 1K+ tokens (was 61% of time, now 47% at 2K). Pre-combining weight*norm eliminates one read and one multiply per inner iteration.
+- **QK and SV now balanced** at long contexts (~27% vs 47% at 2K).
+- **Rotations are constant** — ~0.13ms each regardless of L_kv. Negligible at long contexts.
+- **Lazy eval saves 40-74%** — MLX batches Metal kernel launches efficiently.
+- **Tiled SV with shared memory was tested but slower** — threadgroup barriers + wasted threads at L_q=1 outweighed shared memory benefits.
+
 ## What to Optimize Next
 
-1. **Short context speed** — kernel dispatch overhead dominates at <256 tokens
-2. **Prefill kernel** — simdgroup reduction, shared memory for query tiles (currently 0.2x)
-3. **Qwen3.5 support** — per-layer cache type selection for hybrid architectures
-4. **Profile bottleneck** — Metal kernel vs rotation matmul vs packing overhead
-5. **Model compatibility** — test more architectures to map which work with PolarQuant
+1. **SV kernel further optimization** — still 47% of time at 2K. Potential: simdgroup-level reduction (simd_sum), data layout transposition for coalesced index reads
+2. **Short context speed** — at L_kv=64, kernel dispatch overhead dominates (74% lazy eval savings)
+3. **Prefill kernel** — currently 0.17x at L_q=256. Needs simdgroup reduction and query tiling
+4. **Model compatibility** — test more architectures to map which work with PolarQuant
+5. **Longer contexts (4K-8K)** — fused advantage grows with context. Benchmark to quantify

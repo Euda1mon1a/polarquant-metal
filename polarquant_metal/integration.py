@@ -36,11 +36,15 @@ def patch_sdpa():
     _original_sdpa = base_module.scaled_dot_product_attention
 
     def _patched_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
-        # TurboQuant fused path: compute attention from packed data directly
+        # TurboQuant fused path conditions:
+        # 1. Decode only (L_q == 1) — prefill kernel is too slow for L_q > 1
+        # 2. Context >= min_fused_context — overhead doesn't pay off below this
         if hasattr(cache, "turbo_bits") and cache._fused:
-            return cache.fused_sdpa(queries, scale=scale, mask=mask)
+            L_q = queries.shape[2]
+            if L_q == 1 and cache.offset >= cache.min_fused_context:
+                return cache.fused_sdpa(queries, scale=scale, mask=mask)
 
-        # Fall through to original (handles QuantizedKVCache and standard)
+        # Fall through to original (handles prefill, short context, standard)
         return _original_sdpa(
             queries, keys, values, cache, scale=scale, mask=mask, sinks=sinks,
         )
@@ -75,15 +79,25 @@ def unpatch_sdpa():
 
 
 def make_fused_cache(model, bits: int = 3) -> list:
-    """Create TurboQuantKVCache instances for each layer and patch SDPA.
+    """Create cache instances for each layer and patch SDPA.
+
+    For hybrid models (e.g. Qwen3.5) that mix standard and linear attention,
+    only standard attention layers get TurboQuantKVCache. Linear attention
+    layers keep their native ArraysCache.
 
     Args:
-        model: mlx-lm model (must have .layers and .args)
+        model: mlx-lm model (must have .layers)
         bits: PolarQuant bits per coordinate (2-4)
 
     Returns:
-        List of TurboQuantKVCache, one per layer
+        List of caches, one per layer
     """
-    num_layers = len(model.layers)
     patch_sdpa()
-    return [TurboQuantKVCache(bits=bits, fused=True) for _ in range(num_layers)]
+    caches = []
+    for layer in model.layers:
+        if hasattr(layer, 'is_linear') and layer.is_linear:
+            from mlx_lm.models.cache import ArraysCache
+            caches.append(ArraysCache(size=2))
+        else:
+            caches.append(TurboQuantKVCache(bits=bits, fused=True))
+    return caches

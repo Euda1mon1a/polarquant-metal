@@ -182,13 +182,13 @@ if __name__ == "__main__":
     print("PolarQuant Fused Metal Kernel Benchmark")
     print("=" * 70)
 
-    # Decode scenario: L_q=1, varying L_kv
-    for L_kv in [64, 256, 512, 1024, 2048]:
+    # Decode scenario: L_q=1, varying L_kv (including long contexts)
+    for L_kv in [64, 256, 512, 1024, 2048, 4096, 8192]:
         run_benchmark(L_q=1, L_kv=L_kv, bits=3)
 
     # Prefill scenario: L_q=L_kv
     print("\n\nPrefill scenarios:")
-    for L in [64, 256]:
+    for L in [64, 256, 512]:
         run_benchmark(L_q=L, L_kv=L, bits=3)
 
     # Bit width comparison
