@@ -167,6 +167,36 @@ acc *= norms[k_idx] * scale;  // apply key norm + attention scale
 
 4. **SV kernel is the bottleneck** — 47% of time at 2K tokens. Tiled SV and simd_broadcast_first were both tested and found slower than the simple per-element kernel (Metal L1 cache handles broadcast efficiently). Pre-combined weight*norm optimization gives 25% improvement.
 
+## Prior Art & Novel Contributions
+
+Novelty assessment via Perplexity deep research (2026-03-31).
+
+### Prior Art (not novel to this project)
+
+| Technique | Prior Work |
+|-----------|-----------|
+| Fused QK codebook kernels on Metal | oMLX v0.2.21 and mlx-lm PR #1067 independently implemented |
+| Lazy quantization (FP16 prefill, quantize at decode) | oMLX and PR #1067 converged on same pattern |
+| Sparse V concept | SpargeAttn (ICML 2025, Tsinghua) on CUDA |
+| Asymmetric K/V concept | KIVI (ICML 2024) on CUDA; extended by PackKV (Dec 2025) |
+
+### Novel Contributions (first on Metal/MLX)
+
+1. **Fused SV kernel** -- scores@V directly from packed codebook indices on Metal. No public Metal implementation exists.
+2. **Sparse V on Apple Silicon** -- threshold-based skipping of near-zero attention positions in Metal kernel. SpargeAttn exists on CUDA but has no Metal port.
+3. **Asymmetric K/V in MLX ecosystem** -- different bitwidths for K vs V caches. Nothing in the MLX ecosystem uses this.
+4. **Combined pipeline** -- fused bidirectional attention + Sparse V + asymmetric K/V + adaptive lazy threshold on M4 Pro. "Unambiguously novel" as an integrated system.
+
+**Result:** 75.3 tok/s vs 71.4 tok/s standard (5% faster than FP16 with 8x KV cache compression).
+
+### Key References
+
+- SpargeAttn (ICML 2025) -- sparse warp online softmax, CUDA only
+- KIVI (ICML 2024) -- per-channel K / per-token V quantization, CUDA only
+- PackKV (Dec 2025) -- extends KIVI
+- oMLX v0.2.21 (March 2026) -- fused 2-pass Flash Attention, codebook, Metal
+- mlx-lm PR #1067 (arozanov, March 28 2026) -- fused Metal quantize/dequantize kernels
+
 ## License
 
 MIT

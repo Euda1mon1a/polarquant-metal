@@ -111,6 +111,34 @@ After SV kernel optimization (pre-combined weight*norm):
 - **Lazy eval saves 40-74%** — MLX batches Metal kernel launches efficiently.
 - **Tiled SV with shared memory was tested but slower** — threadgroup barriers + wasted threads at L_q=1 outweighed shared memory benefits.
 
+## Novelty Assessment (2026-03-31, Perplexity Deep Research)
+
+### Prior Art (not novel)
+
+| Technique | Prior Work |
+|-----------|-----------|
+| Fused QK codebook kernels on Metal | oMLX v0.2.21 and mlx-lm PR #1067 independently implemented |
+| Lazy quantization (FP16 prefill → quantize at decode) | oMLX and PR #1067 converged on same pattern |
+| Sparse V concept | SpargeAttn (ICML 2025, Tsinghua) on CUDA |
+| Asymmetric K/V concept | KIVI (ICML 2024) on CUDA; extended by PackKV (Dec 2025) |
+
+### Novel Contributions (first on Metal/MLX)
+
+1. **Fused SV kernel** — scores@V directly from packed codebook indices on Metal. "Undemonstrated publicly on any Metal implementation."
+2. **Sparse V on Apple Silicon** — threshold-based skipping of near-zero attention positions in Metal kernel. SpargeAttn exists on CUDA but no Metal port.
+3. **Asymmetric K/V in MLX ecosystem** — different bitwidths for K vs V. Nothing in MLX uses this.
+4. **Combined pipeline** — fused bidirectional attention + Sparse V + asymmetric K/V + adaptive lazy threshold on M4 Pro. "Unambiguously novel" as a system.
+
+**Result:** 75.3 tok/s vs 71.4 tok/s standard (5% faster than FP16 with 8x KV cache compression).
+
+### Key References
+
+- SpargeAttn (ICML 2025) — sparse warp online softmax, CUDA
+- KIVI (ICML 2024) — per-channel K / per-token V quantization, CUDA
+- PackKV (Dec 2025) — extends KIVI
+- oMLX v0.2.21 (March 2026) — fused 2-pass Flash Attention, codebook, Metal
+- mlx-lm PR #1067 (arozanov, March 28 2026) — fused Metal quantize/dequantize kernels
+
 ## What to Optimize Next
 
 1. **SV kernel further optimization** — still 47% of time at 2K. Potential: simdgroup-level reduction (simd_sum), data layout transposition for coalesced index reads
