@@ -55,11 +55,12 @@ class TurboQuantKVCache:
 
     step = 256
 
-    def __init__(self, bits: int = 3, fused: bool = True, min_fused_context: int = 512,
-                 sparse_v_threshold: float = 1e-3):
+    def __init__(self, bits: int = 3, bits_v: int = None, fused: bool = True,
+                 min_fused_context: int = 512, sparse_v_threshold: float = 1e-3):
         if bits not in (2, 3, 4):
             raise ValueError(f"bits must be 2, 3, or 4, got {bits}")
-        self.turbo_bits = bits
+        self.turbo_bits = bits  # K bits (also used as default for V)
+        self._bits_v = bits_v if bits_v is not None else bits
         self.offset = 0
         self._fused = fused
         self.min_fused_context = min_fused_context
@@ -88,11 +89,11 @@ class TurboQuantKVCache:
         """Lazy initialization once we know head_dim."""
         self._head_dim = head_dim
         self._key_pq = PolarQuant(bits=self.turbo_bits, dim=head_dim, seed=42)
-        self._value_pq = PolarQuant(bits=self.turbo_bits, dim=head_dim, seed=43)
+        self._value_pq = PolarQuant(bits=self._bits_v, dim=head_dim, seed=43)
 
         if self._fused:
             self._key_centroids_f32 = load_codebook_f32(self.turbo_bits, head_dim)
-            self._value_centroids_f32 = load_codebook_f32(self.turbo_bits, head_dim)
+            self._value_centroids_f32 = load_codebook_f32(self._bits_v, head_dim)
 
     def update_and_fetch(self, keys, values):
         """Store new KV entries. Uses FP16 until context reaches threshold,
@@ -135,16 +136,19 @@ class TurboQuantKVCache:
         k_idx, k_norms = self._key_pq.quantize(keys)
         v_idx, v_norms = self._value_pq.quantize(values)
         k_packed = pack_indices(k_idx, self.turbo_bits)
-        v_packed = pack_indices(v_idx, self.turbo_bits)
+        v_packed = pack_indices(v_idx, self._bits_v)
 
-        needed = prev + S
-        if self._k_packed is None or needed > self._k_packed.shape[2]:
-            self._expand(B, n_kv_heads, S, keys.dtype, k_packed.shape[-1])
-
-        self._k_packed[..., prev:prev + S, :] = k_packed
-        self._k_norms[..., prev:prev + S, :] = k_norms
-        self._v_packed[..., prev:prev + S, :] = v_packed
-        self._v_norms[..., prev:prev + S, :] = v_norms
+        # Concatenate onto existing packed storage
+        if self._k_packed is None:
+            self._k_packed = k_packed
+            self._k_norms = k_norms
+            self._v_packed = v_packed
+            self._v_norms = v_norms
+        else:
+            self._k_packed = mx.concatenate([self._k_packed, k_packed], axis=2)
+            self._k_norms = mx.concatenate([self._k_norms, k_norms], axis=2)
+            self._v_packed = mx.concatenate([self._v_packed, v_packed], axis=2)
+            self._v_norms = mx.concatenate([self._v_norms, v_norms], axis=2)
         self.offset += S
 
         if self._fused:
@@ -170,15 +174,15 @@ class TurboQuantKVCache:
         k_idx, k_norms = self._key_pq.quantize(self._fp16_keys)
         v_idx, v_norms = self._value_pq.quantize(self._fp16_values)
         k_packed = pack_indices(k_idx, self.turbo_bits)
-        v_packed = pack_indices(v_idx, self.turbo_bits)
+        v_packed = pack_indices(v_idx, self._bits_v)
 
-        # Allocate packed storage
-        self._expand(B, n_kv_heads, L, self._fp16_keys.dtype,
-                     k_packed.shape[-1])
-        self._k_packed[..., :L, :] = k_packed
-        self._k_norms[..., :L, :] = k_norms
-        self._v_packed[..., :L, :] = v_packed
-        self._v_norms[..., :L, :] = v_norms
+        # Allocate packed storage (K and V may have different packed dims)
+        dtype = self._fp16_keys.dtype
+        shape_n = (B, n_kv_heads, L, 1)
+        self._k_packed = k_packed
+        self._k_norms = k_norms
+        self._v_packed = v_packed
+        self._v_norms = v_norms
 
         # Free FP16 storage
         self._fp16_keys = None
@@ -246,7 +250,7 @@ class TurboQuantKVCache:
             v_norms=v_norms,
             v_centroids=self._value_centroids_f32,
             head_dim=self._head_dim,
-            bits=self.turbo_bits,
+            bits=self._bits_v,
             sparse_v_threshold=self.sparse_v_threshold,
         )
 

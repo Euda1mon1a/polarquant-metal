@@ -78,26 +78,49 @@ def unpatch_sdpa():
     _original_sdpa = None
 
 
-def make_fused_cache(model, bits: int = 3) -> list:
+def make_fused_cache(model, bits: int = 3, bits_v: int = None,
+                     boundary_layers: int = 2) -> list:
     """Create cache instances for each layer and patch SDPA.
 
     For hybrid models (e.g. Qwen3.5) that mix standard and linear attention,
     only standard attention layers get TurboQuantKVCache. Linear attention
     layers keep their native ArraysCache.
 
+    Boundary layer protection: first N and last N standard attention layers
+    use FP16 KVCache (no quantization) to preserve quality at the layers
+    that matter most. Middle layers get asymmetric K/V compression.
+
     Args:
         model: mlx-lm model (must have .layers)
-        bits: PolarQuant bits per coordinate (2-4)
+        bits: PolarQuant bits for K (default 3)
+        bits_v: PolarQuant bits for V (default same as bits). Lower is
+            safe because Sparse V skips near-zero positions.
+        boundary_layers: number of first/last standard attention layers
+            to keep at FP16 (default 2). Set to 0 to compress all.
 
     Returns:
         List of caches, one per layer
     """
+    from mlx_lm.models.cache import KVCache
     patch_sdpa()
+
+    # Identify standard attention layer indices
+    std_indices = [i for i, l in enumerate(model.layers)
+                   if not (hasattr(l, 'is_linear') and l.is_linear)]
+    n_std = len(std_indices)
+
+    # Boundary layers: first N and last N standard attention layers stay FP16
+    boundary_set = set()
+    if boundary_layers > 0 and n_std > 2 * boundary_layers:
+        boundary_set = set(std_indices[:boundary_layers] + std_indices[-boundary_layers:])
+
     caches = []
-    for layer in model.layers:
+    for i, layer in enumerate(model.layers):
         if hasattr(layer, 'is_linear') and layer.is_linear:
             from mlx_lm.models.cache import ArraysCache
             caches.append(ArraysCache(size=2))
+        elif i in boundary_set:
+            caches.append(KVCache())
         else:
-            caches.append(TurboQuantKVCache(bits=bits, fused=True))
+            caches.append(TurboQuantKVCache(bits=bits, bits_v=bits_v, fused=True))
     return caches
