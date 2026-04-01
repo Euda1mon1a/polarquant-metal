@@ -143,3 +143,18 @@ quantized with before assuming the draft model isn't contributing overhead.
 The current codebase has never been profiled at the Metal level. `use_optimal_threadgroups`
 should be added first (zero risk, zero logic change), then a profiling pass before any
 further kernel body edits.
+
+---
+
+## Source Material
+
+This document synthesizes findings from the following sources, archived in DEVONthink
+(`Research_Capture` database, tag `polarquant`):
+
+- MLX PR #1833 — `use_optimal_threadgroups` dispatch mode
+- MLX issue #3251 — `group_size=32` throughput regression and SMEM fix
+- OpenEvolve HuggingFace blog — automated kernel search methodology
+- r/LocalLLaMA thread — Qwen3 GQA optimization via OpenEvolve
+
+**Repository**: Gitea at `http://192.168.4.202:3030/aaron/polarquant-metal` (LAN)
+or `http://100.69.127.98:3030/aaron/polarquant-metal` (Tailscale).

@@ -35,7 +35,7 @@ No inverse rotation of keys needed. The codebook has only 2^bits entries (8 for 
 ## Install
 
 ```bash
-git clone <this-repo>
+git clone http://100.69.127.98:3030/aaron/polarquant-metal.git
 cd polarquant-metal
 python3 -m venv .venv
 ./.venv/bin/pip install -e '.[dev]'
@@ -228,6 +228,12 @@ PolarQuant is deployed on the OpenClaw MLX server (Qwen3.5-35B-A3B-4bit on port 
 ### Client impact
 
 None. Koa's text-router sends standard OpenAI-compatible requests. PolarQuant is entirely server-side.
+
+## Repository & Research
+
+**Source**: Private Gitea at `http://192.168.4.202:3030/aaron/polarquant-metal` (LAN) or `http://100.69.127.98:3030/aaron/polarquant-metal` (Tailscale). Branch `master`.
+
+**Research references**: Background papers, MLX issue threads, and prior art documents are stored in DEVONthink under the `Research_Capture` database, tagged `polarquant`. The `docs/` directory in this repo contains synthesized notes derived from that material.
 
 ## Limitations
 
