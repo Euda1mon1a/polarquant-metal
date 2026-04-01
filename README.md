@@ -102,6 +102,25 @@ Two runtime optimizations that activate automatically on long contexts:
 - 78% skip rate on flowing text, 0% on topic changes (correctly gated)
 - `cache.rigidity_stats` for observability
 
+### Compact-Index Sparse SV (Phase 3, 2026-03-31)
+
+Two-phase Metal kernel that eliminates the O(L_kv) iteration bottleneck:
+
+1. **Index build kernel:** Scans `wn_combined` per head, collects active positions via Metal atomics into a compact index. Positions exceeding the per-head threshold OR marked as zone priors (system prompt, recent tokens) are included.
+2. **Sparse SV kernel:** Iterates only active positions from the compact index. O(active_count) instead of O(L_kv).
+
+| Context | Phase 2 (branch/position) | Phase 3 (compact index) | Speedup |
+|---------|--------------------------|------------------------|---------|
+| 2K | 0.98ms | 0.45ms | 2.2x |
+| 8K | 0.82ms | 0.33ms | 2.5x |
+| 16K | 1.36ms | 0.40ms | 3.4x |
+| 32K | 2.48ms | 0.44ms | 5.6x |
+
+- Entropy threshold amortized every 50 decode steps (zero quality loss)
+- Index build cost ~0.15ms constant regardless of context length
+- Never slower than dense path in any configuration tested
+- Zone prior infrastructure available (`system_prompt_len`, `recent_zone_len` params)
+
 ## Integration with mlx-turboquant
 
 ```python
@@ -250,9 +269,10 @@ Novelty assessment via Perplexity deep research (2026-03-31).
 3. **Asymmetric K/V in MLX ecosystem** -- different bitwidths for K vs V caches. Nothing in the MLX ecosystem uses this.
 4. **Entropy-guided per-head adaptive Sparse V** -- per-head Shannon entropy gates pruning threshold at runtime. Concentrated heads pruned aggressively, spread heads protected. No prior work applies entropy-gated sparse attention to Metal/MLX codebook kernels.
 5. **Rigidity-gated quantization skip** -- cosine similarity of rotated unit vectors detects redundant KV entries and skips quantize+pack. Novel application of anti-churn metrics to KV cache compression.
-6. **Combined pipeline** -- fused bidirectional attention + adaptive Sparse V + rigidity gate + asymmetric K/V + lazy threshold on M4 Pro. "Unambiguously novel" as an integrated system.
+6. **Compact-index sparse SV with atomic index build** -- two-phase kernel: Metal atomics build position index, sparse kernel iterates only active positions. 5.6x at 32K. No prior Metal implementation of atomic-indexed sparse attention.
+7. **Combined pipeline** -- fused attention + entropy-adaptive Sparse V + compact-index dispatch + rigidity gate + asymmetric K/V + amortized entropy + zone priors on M4 Pro.
 
-**Result:** 75.3 tok/s vs 71.4 tok/s standard (5% faster than FP16 with 8x KV cache compression). Phase 2 adds per-head adaptive gains on top.
+**Result:** 75.3→81 tok/s on Qwen3.5-35B (vs 71.4 standard). Phase 3 SV kernel 5.6x faster at 32K. 9 cross-disciplinary experiments documented (4 wins, 4 negatives, 1 partial).
 
 ### Key References
 
