@@ -1,6 +1,6 @@
 # PolarQuant Optimization Experiments — Consolidated Findings
 
-> **Date:** 2026-03-31
+> **Updated:** 2026-03-31
 > **Platform:** Mac Mini M4 Pro 64GB, Metal GPU
 > **Model config:** B=1, 8 query heads, 2 KV heads (GQA 4:1), D=128, 3-bit PolarQuant
 > **Origin:** Cross-pollination from AAPM exotic resilience math (entropy, time crystal, foam topology, catastrophe theory)
@@ -9,8 +9,9 @@
 
 ## Overview
 
-Four experiments tested whether physics/information-theory concepts from the AAPM
-scheduling project could optimize PolarQuant's KV cache compression on Apple Silicon.
+Nine experiments tested whether physics/information-theory/queuing-theory concepts
+from the AAPM scheduling project could optimize PolarQuant's KV cache compression
+on Apple Silicon.
 
 | # | Experiment | AAPM Source | Target | Verdict |
 |---|---|---|---|---|
@@ -18,6 +19,11 @@ scheduling project could optimize PolarQuant's KV cache compression on Apple Sil
 | 2 | Anti-churn rigidity gate | `periodicity/anti_churn.py` | Quantization overhead | **Signal validated** |
 | 3 | Stroboscopic drift detection | `periodicity/subharmonic_detector.py` | Cumulative quality drift | **No drift found** |
 | 4 | Spectral bit-width selection | `periodicity/subharmonic_detector.py` | Memory (per-head bit-width) | **Hypothesis rejected** |
+| 5 | Hub token protection | Scale-free network analysis | Sparse V quality | **Confirmed safe** |
+| 6 | STA/LTA entropy amortization | `resilience/seismic_detection.py` | Entropy computation overhead | **Strong win (fixed interval)** |
+| 7 | Blast radius zones | `resilience/blast_radius.py` | Fault isolation | See EXP7_RESULTS.md |
+| 8 | SPC/Western Electric quality | `resilience/spc.py` | Quality monitoring | See EXP8_RESULTS.md |
+| 9 | Erlang workload prediction | `queuing/erlang_c.py` | SV kernel dispatch | **Partial (accurate but too costly)** |
 
 ---
 
@@ -115,16 +121,93 @@ roughly doubling the savings.
 
 ---
 
+## Experiment 6: STA/LTA Change-Point Detection for Entropy Amortization
+
+**Concept:** Phase 2a computes per-head Shannon entropy on EVERY decode step to set adaptive sparse V thresholds. Inspired by AAPM's `seismic_detection.py`, use STA/LTA ratio to detect when attention patterns shift, and only recompute entropy at those points.
+
+**Key results (2K context, 500 decode steps, 2 regime transitions):**
+
+| Strategy | Entropy Computes | Reduction | Cos Sim | Time | Speedup |
+|---|---|---|---|---|---|
+| Always recompute | 500/500 | 0% | 0.983016 | 1.01s | 1.00x |
+| STA/LTA (best) STA=3 LTA=20 t=1.5 | 31/500 | 93.8% | 0.983016 | 0.52s | 1.94x |
+| Fixed interval=25 | 20/500 | 96.0% | 0.983016 | 0.45s | 2.24x |
+| **Fixed interval=50** | **10/500** | **98.0%** | **0.983016** | **0.44s** | **2.30x** |
+
+**Critical finding:** All strategies produce **identical quality** (cos=0.983016). The entropy-to-threshold sigmoid mapping is regime-robust — cached thresholds work across both concentrated and mixed attention regimes without degradation.
+
+**Why STA/LTA lost to fixed interval:**
+- STA/LTA with trigger >= 2.0 misses transitions entirely (stat changes by 2x, not enough for ratio-based detection)
+- STA/LTA with trigger 1.5 catches transitions but fires too often (more computes)
+- Quality is identical regardless of strategy, making transition detection irrelevant
+- Fixed interval is simpler, faster (no per-step stat computation), and equally effective
+
+**Status:** Ready for integration. Use fixed interval=50 recomputation in `fused_sdpa()`.
+
+---
+
+## Experiment 9: Erlang Queuing Model for Sparse V Workload Prediction
+
+**Concept:** The SV kernel iterates ALL L_kv positions to check `if (|wn_val| > threshold)` even when concentrated heads skip ~99%. Inspired by AAPM's `queuing/erlang_c.py`: can we predict HOW MANY positions will exceed the threshold from a cheap sample, enabling dispatch decisions (skip/sparse/dense) without scanning everything?
+
+**Three models tested:**
+1. **Top-k exponential tail:** Sample top-k weights (O(L_kv) partial sort), fit exponential decay, extrapolate to predict count above threshold
+2. **Erlang utilization:** Map mean weight as arrival rate, threshold as service rate; P(active) = exp(-threshold/mean)
+3. **Hybrid:** Top-k calibrates Erlang tail model
+
+**Key results (16K context, 5 distributions, 5 thresholds):**
+
+| Model | Mean Error | Cases <20% Error | Dispatch Accuracy |
+|---|---|---|---|
+| Top-k (k=100) | 32.2% | 68% | 89.5% |
+| Erlang utilization | 13,166% | 16% | 79.5% |
+| **Hybrid** | **32.1%** | **68%** | **90.0%** |
+
+**Prediction accuracy is strong for concentrated/spread distributions (0% error) but poor for bimodal (131-246% error).** The exponential tail assumption breaks when the distribution has multiple modes.
+
+**Critical finding: prediction is 8-12x MORE EXPENSIVE than full scan.** At L_kv=16K, the full threshold check takes ~141us on Metal. Top-k prediction takes ~1,752us. Even at L_kv=65K, the scan stays ~134us while prediction grows to ~2,146us. The Metal GPU's branch check is so cheap that prediction overhead cannot amortize it.
+
+**Why it failed on cost:** The SV kernel's `if (wn_val > threshold)` check is a single branch instruction per position, executed entirely on the GPU. The prediction models require CPU-side numpy/MLX ops (topk, sort, mean) with Python loop overhead. The CPU-GPU data transfer alone exceeds the GPU's scan cost.
+
+**Where it WOULD help:** If dispatch decisions could be made in a Metal kernel preamble (no CPU round-trip), or at extreme context lengths (>1M tokens) where scan cost grows linearly but tail estimation stays O(k).
+
+**Status:** Partial. Accurate for dispatch decisions (90%) but not cost-effective at current context lengths.
+
+---
+
+## Unexplored Avenues (from AAPM exotic library)
+
+Documented for future investigation. Each has a plausible PolarQuant angle but was not tested.
+
+| AAPM Module | Concept | PolarQuant Angle | Priority |
+|---|---|---|---|
+| `soc_predictor.py` | Power-law distributions, critical slowing down | Attention weights follow approximate power laws. Estimate exponent α from top-k to predict optimal sparse threshold analytically — could replace entropy entirely with a cheaper estimator. | **Medium** — Exp 9 showed top-k prediction is accurate (90% dispatch), just too expensive in Python. A Metal kernel preamble version could work. |
+| `propulsion_zones.py` | Negative viscosity, constraint alignment | Identify contiguous position RANGES where attention is concentrated (recency bias). Process as vectorized blocks instead of per-position checks — better memory coalescing in SV kernel. | **Medium** — directly attacks the 88% SV bottleneck via memory access pattern, not pruning. Different angle from all other experiments. |
+| `creep_fatigue.py` | Larson-Miller parameter, Miner's cumulative damage | Track cumulative quantization error over conversation lifetime. Predict time-to-failure under sustained load. | **Low** — Exp 3 showed no drift. Cumulative damage model has no target. |
+| `defense_in_depth.py` | 5-level nuclear safety, N+2 redundancy | Formalize existing quality gates (entropy → threshold → rigidity) as layered defense levels. Ensure each operates independently. | **Low** — we already have layered gates. Formalizing adds indirection, not capability. |
+| `recovery_distance.py` | Min-edit graph distance to feasibility | After aggressive quantization (2-bit zone), compute minimum number of position upgrades needed to restore target quality. Could inform zone boundary placement. | **Low** — interesting for Exp 7 zone tuning but incremental. |
+| `burnout_epidemiology.py` / `contagion_model.py` | SIR epidemic model | Model quantization error "spreading" through transformer layers. If one layer's error infects downstream layers, early layers need higher precision. | **Low** — Exp 3 found no error accumulation. Layer-to-layer infection hypothesis unsupported. |
+| `circadian_model.py` | Circadian rhythms | Time-of-day adaptive precision: clinic hours → higher quality (4-bit), sleeping → aggressive compression (2-bit). Governor already handles presence-based shedding. | **Low** — governor + context-update already does this at the service level. Per-bit-width adaptation is novel but marginal. |
+
+**Most promising unexplored:** SOC power-law (as Metal kernel preamble) and propulsion zones (contiguous-range vectorized access). Both attack the SV kernel bottleneck from angles not covered by existing experiments.
+
+---
+
 ## Combination Analysis
 
 ### What works together
 
 | Combination | Viable? | Rationale |
 |---|---|---|
-| Entropy (1) + Rigidity (2) | **Yes** | Different pipeline stages, no interference |
-| Entropy (1) + Stroboscopic (3) | Monitoring only | No drift to correct, but useful as safety net |
-| Rigidity (2) + Stroboscopic (3) | No | Rigidity saves quantization work; no drift means no checkpoints needed |
-| Spectral (4) + anything | **No** | Hypothesis rejected; rotation decorrelation makes pattern-based bit selection ineffective |
+| Entropy (1) + Rigidity (2) | **Yes — SHIPPED** | Different pipeline stages, no interference |
+| Entropy (1) + Amortization (6) | **Yes — ready** | 6 reduces cost of 1 by 98%; direct integration path |
+| Entropy (1) + Zones (7) | **Yes — ready** | 7 changes quantization policy, 1 changes attention kernel. Independent. |
+| Amortization (6) + Zones (7) | **Yes** | Both ready, no overlap. 6 is attention-side, 7 is storage-side. |
+| Entropy (1) + Stroboscopic (3) | Monitoring only | No drift to correct, useful as safety net |
+| Hub (5) + anything | **No** | Hub-ness is query-dependent, not stable |
+| Spectral (4) + anything | **No** | Rotation decorrelation makes pattern-based bit selection ineffective |
+| SPC (8) + anything | **No** | Per-step noise from query randomness makes control charts impractical |
+| Erlang (9) + Metal preamble | **Maybe (future)** | Prediction is accurate but CPU cost kills it. Metal-native version could work at >1M context |
 | Foam T1 + anything | **No** | Drift doesn't exist; event-driven correction has no target |
 
 ### Implemented (2026-03-31)
@@ -156,6 +239,16 @@ roughly doubling the savings.
 | `benchmarks/EXP3_RESULTS.md` | Experiment 3 detailed results |
 | `benchmarks/exp4_spectral_bitwidth.py` | Experiment 4 script |
 | `benchmarks/EXP4_RESULTS.md` | Experiment 4 detailed results |
+| `benchmarks/exp5_hub_tokens.py` | Experiment 5 script |
+| `benchmarks/EXP5_RESULTS.md` | Experiment 5 detailed results |
+| `benchmarks/exp6_sta_lta.py` | Experiment 6 script |
+| `benchmarks/EXP6_RESULTS.md` | Experiment 6 detailed results |
+| `benchmarks/exp7_blast_radius_zones.py` | Experiment 7 script |
+| `benchmarks/EXP7_RESULTS.md` | Experiment 7 detailed results |
+| `benchmarks/exp8_spc_quality.py` | Experiment 8 script |
+| `benchmarks/EXP8_RESULTS.md` | Experiment 8 detailed results |
+| `benchmarks/exp9_erlang_workload.py` | Experiment 9 script |
+| `benchmarks/EXP9_RESULTS.md` | Experiment 9 detailed results |
 | `benchmarks/stress_test_long_context.py` | 16K-32K stress test |
 | `benchmarks/STRESS_RESULTS.md` | Stress test results |
 | `benchmarks/EXPERIMENTS.md` | This consolidated document |

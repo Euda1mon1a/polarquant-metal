@@ -324,6 +324,202 @@ def _build_sv_precombined_kernel(bits: int):
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase 3: Compact-index sparse SV kernels
+# ---------------------------------------------------------------------------
+# Two-phase approach:
+#   1. Index build: scan wn_combined, collect active positions via atomics
+#   2. Sparse SV: iterate only active positions from compact index
+#
+# Conceptual framing: the KV cache is a probability field. Softmax collapses
+# it. The active index IS the collapsed wavefunction. Zone priors (system
+# prompt always active) are Bayesian priors on the field.
+
+_SV_INDEX_BUILD_SOURCE = """
+    uint k = thread_position_in_grid.x;
+    uint L_kv = wn_shape[3];
+    uint n_heads = wn_shape[1];
+
+    if (k >= L_kv) return;
+
+    // Stride for per-head output: each head gets (1 + L_kv) slots
+    uint stride = 1 + L_kv;
+
+    for (uint bh = 0; bh < wn_shape[0] * n_heads; bh++) {
+        uint b_idx = bh / n_heads;
+        uint h_idx = bh % n_heads;
+
+        uint wn_offset = ((b_idx * n_heads + h_idx) * wn_shape[2]) * L_kv + k;
+        float wn_val = float(wn[wn_offset]);
+        float thresh = float(sparse_thresh[h_idx]);
+        bool is_prior = zone_prior[k] > 0u;
+
+        if (is_prior || wn_val > thresh || wn_val < -thresh) {
+            uint head_base = bh * stride;
+            uint slot = atomic_fetch_add_explicit(
+                &count_and_indices[head_base], 1u, memory_order_relaxed);
+            atomic_store_explicit(
+                &count_and_indices[head_base + 1 + slot], k, memory_order_relaxed);
+        }
+    }
+"""
+
+
+def _build_sv_index_kernel():
+    """Build the index-building kernel for Phase 3 sparse SV."""
+    return mx.fast.metal_kernel(
+        name="polarquant_sv_index_build",
+        input_names=["wn", "sparse_thresh", "zone_prior"],
+        output_names=["count_and_indices"],
+        header="",
+        source=_SV_INDEX_BUILD_SOURCE,
+        atomic_outputs=True,
+    )
+
+
+_SV_SPARSE_SOURCE = """
+    uint elem = thread_position_in_grid.x;
+
+    uint actual_D = actual_dim[0];
+    uint L_kv = max_L_kv[0];
+    uint L_q = 1;  // Phase 3 is decode-only (L_q=1)
+    uint n_heads = wn_shape[1];
+    uint n_kv_heads = v_indices_shape[1];
+
+    uint d_idx = elem % actual_D;
+    uint h_idx = (elem / actual_D) % n_heads;
+    uint b_idx = elem / (actual_D * n_heads);
+
+    uint kv_h_idx = h_idx / (n_heads / n_kv_heads);
+
+    constexpr uint vals_per_int = 32 / BITS;
+    uint D_packed = (actual_D + vals_per_int - 1) / vals_per_int;
+
+    // Read active count and indices for this head
+    uint stride = 1 + L_kv;
+    uint head_base = (b_idx * n_heads + h_idx) * stride;
+    uint count = count_and_indices[head_base];
+
+    uint wn_base = (b_idx * n_heads + h_idx) * L_kv;
+    uint vi_base = (b_idx * n_kv_heads + kv_h_idx) * L_kv * D_packed;
+
+    float acc = 0.0f;
+    for (uint i = 0; i < count; i++) {
+        uint k = count_and_indices[head_base + 1 + i];
+        float wn_val = float(wn[wn_base + k]);
+        uint idx = unpack_index<BITS>(&v_indices[vi_base + k * D_packed], d_idx);
+        acc += wn_val * float(v_centroids[idx]);
+    }
+
+    out[elem] = T(acc);
+"""
+
+
+def _build_sv_sparse_kernel(bits: int):
+    """Build the sparse SV kernel that iterates only active positions."""
+    return mx.fast.metal_kernel(
+        name=f"polarquant_sv_sparse_{bits}bit",
+        input_names=[
+            "count_and_indices", "wn", "v_indices", "v_centroids",
+            "actual_dim", "max_L_kv",
+        ],
+        output_names=["out"],
+        header=_QK_KERNEL_HEADER,  # reuses unpack_index helper
+        source=_SV_SPARSE_SOURCE,
+    )
+
+
+_sv_index_kernel = None
+_sv_sparse_kernels = {}
+
+
+def polarquant_sv_build_index(
+    wn_combined: mx.array,
+    sparse_thresh: mx.array,
+    zone_prior: mx.array,
+) -> mx.array:
+    """Build compact active position index for sparse SV kernel.
+
+    Scans wn_combined per head. Positions where |wn| > threshold OR
+    zone_prior == 1 are collected into a compact index.
+
+    Args:
+        wn_combined: (B, n_heads, L_q, L_kv) pre-combined weight*norm
+        sparse_thresh: (n_heads,) per-head thresholds
+        zone_prior: (L_kv,) uint32, 1 = always active, 0 = threshold-gated
+
+    Returns:
+        count_and_indices: (B * n_heads * (1 + L_kv),) uint32
+            Layout per head: [count, idx0, idx1, ..., idxN]
+    """
+    global _sv_index_kernel
+    if _sv_index_kernel is None:
+        _sv_index_kernel = _build_sv_index_kernel()
+
+    B, n_heads, L_q, L_kv = wn_combined.shape
+    stride = 1 + L_kv
+    out_size = B * n_heads * stride
+
+    outputs = _sv_index_kernel(
+        inputs=[wn_combined, sparse_thresh, zone_prior],
+        template=[("T", wn_combined.dtype)],
+        output_shapes=[(out_size,)],
+        output_dtypes=[mx.uint32],
+        grid=(L_kv, 1, 1),
+        threadgroup=(min(256, L_kv), 1, 1),
+        init_value=0,
+    )
+    return outputs[0]
+
+
+def polarquant_sv_sparse(
+    count_and_indices: mx.array,
+    wn_combined: mx.array,
+    v_indices: mx.array,
+    v_centroids: mx.array,
+    head_dim: int,
+    L_kv: int,
+    bits: int = 3,
+) -> mx.array:
+    """Sparse SV matmul — iterates only active positions from compact index.
+
+    Args:
+        count_and_indices: (B * n_heads * (1 + L_kv),) from build_index
+        wn_combined: (B, n_heads, L_q, L_kv) pre-combined weight*norm
+        v_indices: (B, n_kv_heads, L_kv, D_packed) packed value indices
+        v_centroids: (n_levels,) codebook
+        head_dim: actual D
+        L_kv: context length (for stride calculation)
+        bits: quantization bits
+
+    Returns:
+        output: (B, n_heads, 1, D) attention output (L_q=1 for decode)
+    """
+    if bits not in _sv_sparse_kernels:
+        _sv_sparse_kernels[bits] = _build_sv_sparse_kernel(bits)
+    kernel = _sv_sparse_kernels[bits]
+
+    B, n_heads = wn_combined.shape[0], wn_combined.shape[1]
+    out_shape = (B, n_heads, 1, head_dim)
+    total_elements = int(np.prod(out_shape))
+
+    actual_dim_arr = mx.array([head_dim], dtype=mx.uint32)
+    max_L_kv_arr = mx.array([L_kv], dtype=mx.uint32)
+
+    outputs = kernel(
+        inputs=[
+            count_and_indices, wn_combined, v_indices, v_centroids,
+            actual_dim_arr, max_L_kv_arr,
+        ],
+        template=[("T", wn_combined.dtype), ("BITS", bits)],
+        output_shapes=[out_shape],
+        output_dtypes=[wn_combined.dtype],
+        grid=(total_elements, 1, 1),
+        threadgroup=(min(256, total_elements), 1, 1),
+    )
+    return outputs[0]
+
+
 # Cache compiled kernels by bit width
 _qk_kernels = {}
 _qk_tiled_kernels = {}

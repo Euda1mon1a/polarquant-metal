@@ -26,7 +26,10 @@ import mlx.core as mx
 from .polar_quant import PolarQuant
 from .packing import pack_indices
 from .codebooks import load_codebook_f32
-from .kernels import polarquant_qk_matmul, polarquant_sv_matmul
+from .kernels import (
+    polarquant_qk_matmul, polarquant_sv_matmul,
+    polarquant_sv_build_index, polarquant_sv_sparse,
+)
 
 
 def _create_causal_mask(N, offset=0, window_size=None):
@@ -56,7 +59,8 @@ class TurboQuantKVCache:
     step = 256
 
     def __init__(self, bits: int = 3, bits_v: int = None, fused: bool = True,
-                 min_fused_context: int = 512, sparse_v_threshold: float = 1e-3):
+                 min_fused_context: int = 512, sparse_v_threshold: float = 1e-3,
+                 system_prompt_len: int = 0, recent_zone_len: int = 0):
         if bits not in (2, 3, 4):
             raise ValueError(f"bits must be 2, 3, or 4, got {bits}")
         self.turbo_bits = bits  # K bits (also used as default for V)
@@ -93,6 +97,15 @@ class TurboQuantKVCache:
         self.rigidity_threshold = 0.90  # cosine sim threshold for index reuse
         self._rigidity_skips = 0
         self._rigidity_total = 0
+
+        # Entropy amortization (Exp 6): recompute every N steps, cache between
+        self.entropy_recompute_interval = 50
+        self._entropy_step_counter = 0
+        self._cached_thresholds = None
+
+        # Zone priors (Phase 3): positions with elevated prior always in active index
+        self.system_prompt_len = system_prompt_len
+        self.recent_zone_len = recent_zone_len
 
     def _init(self, head_dim):
         """Lazy initialization once we know head_dim."""
@@ -286,6 +299,29 @@ class TurboQuantKVCache:
 
         return mx.array(thresholds, dtype=mx.float32)
 
+    def _get_zone_mask(self, L_kv):
+        """Build zone prior mask for Phase 3 sparse SV.
+
+        Positions with prior=1 are always included in the active index,
+        regardless of attention threshold. This implements Bayesian priors
+        on the attention probability field — system prompt and recent tokens
+        have elevated prior probability of importance.
+
+        Args:
+            L_kv: current context length
+
+        Returns:
+            mx.array: (L_kv,) uint32, 1 = always active, 0 = threshold-gated
+        """
+        mask = mx.zeros(L_kv, dtype=mx.uint32)
+        if self.system_prompt_len > 0 and self.system_prompt_len < L_kv:
+            mask = mask.at[:self.system_prompt_len].add(mx.ones(self.system_prompt_len, dtype=mx.uint32))
+        if self.recent_zone_len > 0:
+            start = max(0, L_kv - self.recent_zone_len)
+            rlen = L_kv - start
+            mask = mask.at[start:].add(mx.ones(rlen, dtype=mx.uint32))
+        return mask
+
     def fused_sdpa(self, queries, scale=None, mask=None):
         """Compute full attention using fused Metal kernels.
 
@@ -340,25 +376,58 @@ class TurboQuantKVCache:
         # Softmax
         weights = mx.softmax(scores, axis=-1, precise=True)
 
-        # Entropy-guided adaptive sparse V threshold (Phase 1)
-        # For long contexts, compute attention entropy to decide pruning level.
-        # Short contexts or disabled sparse_v skip the entropy computation entirely.
+        # Entropy-guided adaptive sparse V threshold (Phase 1 + Exp 6 amortization)
+        # Compute per-head entropy every N steps, cache between. Exp 6 showed
+        # thresholds are regime-robust: zero quality loss at interval=50.
         L_kv = weights.shape[-1]
         if self.sparse_v_threshold > 0 and L_kv > 1024:
-            adaptive_threshold = self._compute_adaptive_threshold(weights)
+            self._entropy_step_counter += 1
+            if (self._cached_thresholds is None
+                    or self._entropy_step_counter >= self.entropy_recompute_interval):
+                self._cached_thresholds = self._compute_adaptive_threshold(weights)
+                self._entropy_step_counter = 0
+            adaptive_threshold = self._cached_thresholds
         else:
             adaptive_threshold = self.sparse_v_threshold
 
-        # Fused weights @ V with Sparse V (skip near-zero weight positions)
-        out_rotated = polarquant_sv_matmul(
-            weights=weights,
-            v_indices=v_packed,
-            v_norms=v_norms,
-            v_centroids=self._value_centroids_f32,
-            head_dim=self._head_dim,
-            bits=self._bits_v,
-            sparse_v_threshold=adaptive_threshold,
+        # Phase 3: Compact-index sparse SV when thresholds active and context long.
+        # Falls back to Phase 2 dense kernel for short contexts or zero thresholds.
+        n_heads = weights.shape[1]
+        use_sparse = (
+            isinstance(adaptive_threshold, mx.array)
+            and L_kv > 2048
+            and L_q == 1  # Phase 3 is decode-only
+            and float(adaptive_threshold.max().item()) > 0
         )
+
+        if use_sparse:
+            # Precombine weight*norm for sparse kernel (same as dense precombine)
+            rep = n_heads // v_packed.shape[1]
+            norms_sq = v_norms.squeeze(-1)
+            norms_exp = mx.repeat(norms_sq, rep, axis=1) if rep > 1 else norms_sq
+            wn = weights * norms_exp[:, :, None, :]
+
+            # Build zone prior mask and compact active index
+            zone_mask = self._get_zone_mask(L_kv)
+            count_and_indices = polarquant_sv_build_index(wn, adaptive_threshold, zone_mask)
+
+            # Sparse SV: iterate only active positions
+            out_rotated = polarquant_sv_sparse(
+                count_and_indices, wn, v_packed,
+                self._value_centroids_f32,
+                self._head_dim, L_kv, self._bits_v,
+            )
+        else:
+            # Dense fallback (Phase 2 kernel)
+            out_rotated = polarquant_sv_matmul(
+                weights=weights,
+                v_indices=v_packed,
+                v_norms=v_norms,
+                v_centroids=self._value_centroids_f32,
+                head_dim=self._head_dim,
+                bits=self._bits_v,
+                sparse_v_threshold=adaptive_threshold,
+            )
 
         # Inverse rotation from value basis
         output = out_rotated @ self._value_pq.rotation
