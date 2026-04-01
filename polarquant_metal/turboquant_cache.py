@@ -218,17 +218,16 @@ class TurboQuantKVCache:
                 self._prev_k_unit_rotated = k_unit @ self._key_pq.rotation_t
                 self._prev_v_unit_rotated = v_unit @ self._value_pq.rotation_t
 
-        # Concatenate onto existing packed storage
-        if self._k_packed is None:
-            self._k_packed = k_packed
-            self._k_norms = k_norms
-            self._v_packed = v_packed
-            self._v_norms = v_norms
-        else:
-            self._k_packed = mx.concatenate([self._k_packed, k_packed], axis=2)
-            self._k_norms = mx.concatenate([self._k_norms, k_norms], axis=2)
-            self._v_packed = mx.concatenate([self._v_packed, v_packed], axis=2)
-            self._v_norms = mx.concatenate([self._v_norms, v_norms], axis=2)
+        # Pre-allocate or grow in step-aligned blocks; write via scatter update.
+        # Avoids O(L_kv) concatenate every decode step (was quadratic at long context).
+        if (self._k_packed is None
+                or self.offset + S > self._k_packed.shape[2]):
+            self._expand(B, n_kv_heads, S, k_norms.dtype,
+                         k_packed.shape[-1], v_packed.shape[-1])
+        self._k_packed = self._k_packed.at[..., self.offset:self.offset + S, :].add(k_packed)
+        self._k_norms  = self._k_norms.at[...,  self.offset:self.offset + S, :].add(k_norms)
+        self._v_packed = self._v_packed.at[..., self.offset:self.offset + S, :].add(v_packed)
+        self._v_norms  = self._v_norms.at[...,  self.offset:self.offset + S, :].add(v_norms)
         self.offset += S
 
         if self._fused:
@@ -449,32 +448,41 @@ class TurboQuantKVCache:
             self._bits_v, self._head_dim,
         )
 
-    def _expand(self, B, n_kv_heads, new_tokens, dtype, packed_dim):
-        """Allocate or expand compressed storage."""
+    def _expand(self, B, n_kv_heads, new_tokens, dtype, packed_dim_k, packed_dim_v=None):
+        """Allocate or expand compressed storage in step-aligned blocks.
+
+        Grows the buffer by ceil(new_tokens / step) * step slots. Called when the
+        current capacity (shape[2]) is insufficient. Between expansions, decode steps
+        write via scatter update (at[].add()) which is O(S) not O(L_kv).
+        """
+        if packed_dim_v is None:
+            packed_dim_v = packed_dim_k
         alloc = ((self.step + new_tokens - 1) // self.step) * self.step
-        shape_p = (B, n_kv_heads, alloc, packed_dim)
+        shape_k = (B, n_kv_heads, alloc, packed_dim_k)
+        shape_v = (B, n_kv_heads, alloc, packed_dim_v)
         shape_n = (B, n_kv_heads, alloc, 1)
 
         if self._k_packed is not None and self.offset > 0:
-            old = (
+            self._k_packed = mx.concatenate([
                 self._k_packed[..., :self.offset, :],
+                mx.zeros(shape_k, dtype=mx.uint32),
+            ], axis=2)
+            self._k_norms = mx.concatenate([
                 self._k_norms[..., :self.offset, :],
+                mx.zeros(shape_n, dtype=dtype),
+            ], axis=2)
+            self._v_packed = mx.concatenate([
                 self._v_packed[..., :self.offset, :],
+                mx.zeros(shape_v, dtype=mx.uint32),
+            ], axis=2)
+            self._v_norms = mx.concatenate([
                 self._v_norms[..., :self.offset, :],
-            )
-            new = (
-                mx.zeros(shape_p, dtype=mx.uint32),
                 mx.zeros(shape_n, dtype=dtype),
-                mx.zeros(shape_p, dtype=mx.uint32),
-                mx.zeros(shape_n, dtype=dtype),
-            )
-            self._k_packed, self._k_norms, self._v_packed, self._v_norms = (
-                mx.concatenate([o, n], axis=2) for o, n in zip(old, new)
-            )
+            ], axis=2)
         else:
-            self._k_packed = mx.zeros(shape_p, dtype=mx.uint32)
+            self._k_packed = mx.zeros(shape_k, dtype=mx.uint32)
             self._k_norms = mx.zeros(shape_n, dtype=dtype)
-            self._v_packed = mx.zeros(shape_p, dtype=mx.uint32)
+            self._v_packed = mx.zeros(shape_v, dtype=mx.uint32)
             self._v_norms = mx.zeros(shape_n, dtype=dtype)
 
     @property
