@@ -85,6 +85,15 @@ class TurboQuantKVCache:
         self._key_centroids_f32 = None
         self._value_centroids_f32 = None
 
+        # Rigidity gate state (Phase 2b): previous token's packed data for reuse
+        self._prev_k_packed = None
+        self._prev_v_packed = None
+        self._prev_k_unit_rotated = None  # for cheap cosine comparison
+        self._prev_v_unit_rotated = None
+        self.rigidity_threshold = 0.90  # cosine sim threshold for index reuse
+        self._rigidity_skips = 0
+        self._rigidity_total = 0
+
     def _init(self, head_dim):
         """Lazy initialization once we know head_dim."""
         self._head_dim = head_dim
@@ -138,11 +147,63 @@ class TurboQuantKVCache:
             return self._fp16_keys, self._fp16_values
 
         # Quantized mode: compress and store
+        # Phase 2b: Rigidity gate — skip quantize+pack if new token's rotated
+        # unit vector is nearly identical to previous token's (cosine sim > threshold).
+        # Only applies to single-token decode (S=1) after we have a previous token.
         prev = self.offset
-        k_idx, k_norms = self._key_pq.quantize(keys)
-        v_idx, v_norms = self._value_pq.quantize(values)
-        k_packed = pack_indices(k_idx, self.turbo_bits)
-        v_packed = pack_indices(v_idx, self._bits_v)
+
+        if (S == 1 and self._prev_k_packed is not None
+                and self.rigidity_threshold > 0):
+            # Compute rotated unit vectors (cheap: normalize + matmul)
+            k_norms_new = mx.linalg.norm(keys, axis=-1, keepdims=True)
+            v_norms_new = mx.linalg.norm(values, axis=-1, keepdims=True)
+            k_unit = keys / mx.maximum(k_norms_new, 1e-8)
+            v_unit = values / mx.maximum(v_norms_new, 1e-8)
+            k_rotated = k_unit @ self._key_pq.rotation_t
+            v_rotated = v_unit @ self._value_pq.rotation_t
+
+            # Cosine similarity with previous token (dot product of unit vectors)
+            k_sim = (k_rotated * self._prev_k_unit_rotated).sum(axis=-1).mean()
+            v_sim = (v_rotated * self._prev_v_unit_rotated).sum(axis=-1).mean()
+            mx.eval(k_sim, v_sim)
+
+            self._rigidity_total += 1
+
+            if float(k_sim.item()) > self.rigidity_threshold and float(v_sim.item()) > self.rigidity_threshold:
+                # Reuse previous packed indices, only update norms
+                k_packed = self._prev_k_packed
+                v_packed = self._prev_v_packed
+                k_norms = k_norms_new
+                v_norms = v_norms_new
+                self._prev_k_unit_rotated = k_rotated
+                self._prev_v_unit_rotated = v_rotated
+                self._rigidity_skips += 1
+            else:
+                # Full quantization path
+                k_idx, k_norms = self._key_pq.quantize(keys)
+                v_idx, v_norms = self._value_pq.quantize(values)
+                k_packed = pack_indices(k_idx, self.turbo_bits)
+                v_packed = pack_indices(v_idx, self._bits_v)
+                # Update rigidity state
+                self._prev_k_packed = k_packed
+                self._prev_v_packed = v_packed
+                self._prev_k_unit_rotated = k_rotated
+                self._prev_v_unit_rotated = v_rotated
+        else:
+            k_idx, k_norms = self._key_pq.quantize(keys)
+            v_idx, v_norms = self._value_pq.quantize(values)
+            k_packed = pack_indices(k_idx, self.turbo_bits)
+            v_packed = pack_indices(v_idx, self._bits_v)
+            # Initialize rigidity state for next token
+            if S == 1 and self.rigidity_threshold > 0:
+                k_norms_init = mx.linalg.norm(keys, axis=-1, keepdims=True)
+                v_norms_init = mx.linalg.norm(values, axis=-1, keepdims=True)
+                k_unit = keys / mx.maximum(k_norms_init, 1e-8)
+                v_unit = values / mx.maximum(v_norms_init, 1e-8)
+                self._prev_k_packed = k_packed
+                self._prev_v_packed = v_packed
+                self._prev_k_unit_rotated = k_unit @ self._key_pq.rotation_t
+                self._prev_v_unit_rotated = v_unit @ self._value_pq.rotation_t
 
         # Concatenate onto existing packed storage
         if self._k_packed is None:
@@ -194,6 +255,36 @@ class TurboQuantKVCache:
         self._fp16_keys = None
         self._fp16_values = None
         self._quantized = True
+
+    def _compute_adaptive_threshold(self, weights):
+        """Compute per-head entropy-guided sparse V thresholds.
+
+        Low entropy (concentrated attention) -> use configured threshold.
+        High entropy (spread attention) -> disable pruning.
+        Returns per-head threshold array for Phase 2a Metal kernel.
+
+        Args:
+            weights: (B, n_heads, L_q, L_kv) post-softmax attention weights
+
+        Returns:
+            mx.array: (n_heads,) per-head thresholds in [0, sparse_v_threshold]
+        """
+        n_heads = weights.shape[1]
+        eps = 1e-10
+        log_w = mx.log(weights + eps)
+        # Per-head entropy: (B, n_heads, L_q) -> mean over B and L_q -> (n_heads,)
+        head_entropy = -(weights * log_w).sum(axis=-1).mean(axis=(0, 2))  # (n_heads,)
+        max_ent = math.log(weights.shape[-1])
+        mx.eval(head_entropy)
+
+        # Sigmoid mapping per head: low entropy -> high threshold, high entropy -> ~0
+        thresholds = []
+        for h in range(n_heads):
+            norm_ent = float(head_entropy[h].item()) / max_ent
+            t = self.sparse_v_threshold / (1.0 + math.exp(10.0 * (norm_ent - 0.5)))
+            thresholds.append(t)
+
+        return mx.array(thresholds, dtype=mx.float32)
 
     def fused_sdpa(self, queries, scale=None, mask=None):
         """Compute full attention using fused Metal kernels.
@@ -249,6 +340,15 @@ class TurboQuantKVCache:
         # Softmax
         weights = mx.softmax(scores, axis=-1, precise=True)
 
+        # Entropy-guided adaptive sparse V threshold (Phase 1)
+        # For long contexts, compute attention entropy to decide pruning level.
+        # Short contexts or disabled sparse_v skip the entropy computation entirely.
+        L_kv = weights.shape[-1]
+        if self.sparse_v_threshold > 0 and L_kv > 1024:
+            adaptive_threshold = self._compute_adaptive_threshold(weights)
+        else:
+            adaptive_threshold = self.sparse_v_threshold
+
         # Fused weights @ V with Sparse V (skip near-zero weight positions)
         out_rotated = polarquant_sv_matmul(
             weights=weights,
@@ -257,7 +357,7 @@ class TurboQuantKVCache:
             v_centroids=self._value_centroids_f32,
             head_dim=self._head_dim,
             bits=self._bits_v,
-            sparse_v_threshold=self.sparse_v_threshold,
+            sparse_v_threshold=adaptive_threshold,
         )
 
         # Inverse rotation from value basis
@@ -307,6 +407,17 @@ class TurboQuantKVCache:
             self._k_norms = mx.zeros(shape_n, dtype=dtype)
             self._v_packed = mx.zeros(shape_p, dtype=mx.uint32)
             self._v_norms = mx.zeros(shape_n, dtype=dtype)
+
+    @property
+    def rigidity_stats(self):
+        """Return rigidity gate statistics."""
+        if self._rigidity_total == 0:
+            return {"skips": 0, "total": 0, "skip_rate": 0.0}
+        return {
+            "skips": self._rigidity_skips,
+            "total": self._rigidity_total,
+            "skip_rate": self._rigidity_skips / self._rigidity_total,
+        }
 
     # --- mlx-lm cache interface ---
 

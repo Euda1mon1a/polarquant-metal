@@ -296,7 +296,8 @@ _SV_PRECOMBINED_SOURCE = """
     // Sparse V threshold: skip positions where weight*norm is negligible.
     // After softmax, most attention is concentrated on a few positions.
     // Skipping near-zero weights avoids the codebook lookup + multiply.
-    float sv_thresh = sparse_thresh[0];
+    // Per-head threshold: entropy-guided adaptive pruning (Phase 2a).
+    float sv_thresh = sparse_thresh[h_idx];
 
     float acc = 0.0f;
     for (uint k = 0; k < L_kv; k++) {
@@ -416,7 +417,7 @@ def polarquant_sv_matmul(
     head_dim: int,
     bits: int = 3,
     precombine: bool = True,
-    sparse_v_threshold: float = 0.0,
+    sparse_v_threshold=0.0,
 ) -> mx.array:
     """Fused PolarQuant softmax(scores) @ V matmul.
 
@@ -431,8 +432,8 @@ def polarquant_sv_matmul(
         head_dim:   actual head dimension D (before packing)
         bits:       quantization bits (2, 3, or 4)
         precombine: pre-multiply weight*norm on host (default True, ~25% faster)
-        sparse_v_threshold: skip V positions where |weight*norm| < threshold.
-            0.0 disables (default). Try 1e-4 to 1e-3 for speedup at long contexts.
+        sparse_v_threshold: per-head threshold array (n_heads,) or scalar float.
+            Kernel indexes by h_idx. 0.0 disables. Try 1e-4 to 1e-3 for speedup.
 
     Returns:
         output: (B, n_heads, L_q, D) attention output
@@ -444,7 +445,15 @@ def polarquant_sv_matmul(
     out_shape = (B, n_heads, L_q, head_dim)
     total_elements = int(np.prod(out_shape))
     actual_dim_arr = mx.array([head_dim], dtype=mx.uint32)
-    thresh_arr = mx.array([sparse_v_threshold], dtype=mx.float32)
+
+    # Accept scalar or per-head array for sparse_v_threshold
+    if isinstance(sparse_v_threshold, mx.array):
+        thresh_arr = sparse_v_threshold.astype(mx.float32)
+    elif isinstance(sparse_v_threshold, (list, np.ndarray)):
+        thresh_arr = mx.array(sparse_v_threshold, dtype=mx.float32)
+    else:
+        # Scalar — broadcast to per-head array
+        thresh_arr = mx.full((n_heads,), float(sparse_v_threshold), dtype=mx.float32)
 
     if precombine:
         rep = n_heads // n_kv_heads
