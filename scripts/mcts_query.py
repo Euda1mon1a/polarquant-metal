@@ -77,9 +77,11 @@ def main():
     else:
         evaluator = draft_logprob_evaluator(draft_model, tokenizer)
 
-    # Prefill: encode system + user prompt into root cache
+    # Prefill: encode system + user prompt into root cache, get seed token
     print(f"[mcts] Prefilling root cache...")
     root_caches = make_fused_cache(model, bits=args.bits, boundary_layers=2)
+
+    from mlx_lm.sample_utils import make_sampler
 
     messages = [
         {"role": "system", "content": "You are an expert reasoning assistant. Think step by step."},
@@ -89,14 +91,20 @@ def main():
         messages, tokenize=False, add_generation_prompt=True
     )
 
-    # Prefill by running one pass with max_tokens=0 (fills cache)
+    # Prefill: generate exactly 1 token to seed the tree
+    # The cache will have prompt tokens processed; seed_token is the first response token
+    seed_token = None
     for resp in mlx_lm.stream_generate(
         model, tokenizer,
         prompt=prompt,
-        max_tokens=0,
+        max_tokens=1,
+        sampler=make_sampler(temp=0.0),  # greedy for the seed
         prompt_cache=root_caches,
     ):
-        pass  # prefill only
+        seed_token = resp.token
+        break
+
+    print(f"[mcts] Seed token: {seed_token!r} = {tokenizer.decode([seed_token])!r}")
 
     # Run MCTS
     print(f"[mcts] Searching: {args.branches} branches × {args.depth} rounds")
@@ -110,6 +118,7 @@ def main():
         verbose=True,
     )
 
+    tree.set_root_seed(seed_token)
     best = tree.search(
         prompt=args.query,
         n_branches=args.branches,

@@ -77,10 +77,16 @@ class MCTSNode:
 
     Each node holds the full KV cache state at this point in the reasoning
     chain, plus the text and tokens generated to reach this node.
+
+    seed_token is the last generated token at this node — it seeds the next
+    generation step because mlx_lm.stream_generate requires at least one input
+    token and the cache state does NOT include the last yielded token (that token
+    was yielded but not yet processed into the cache).
     """
     caches: list                          # one per model layer
     tokens: list[int]                     # tokens generated at this node only
     text: str                             # text generated at this node only
+    seed_token: Optional[int] = None      # last generated token (seeds children)
     score: float = 0.0                    # cumulative backpropagated value
     visits: int = 0
     parent: Optional[MCTSNode] = None
@@ -178,15 +184,23 @@ class MCTSTree:
         Returns:
             List of new child MCTSNode instances.
         """
+        if node.seed_token is None:
+            raise RuntimeError(
+                "MCTSNode.seed_token is None — call MCTSTree.set_root_seed() "
+                "after prefilling the root cache to provide the first token."
+            )
         children = []
         for _ in range(n_branches):
             branch_caches = fork_layer_caches(node.caches)
-            step_tokens, step_text = self._generate_step(branch_caches)
+            step_tokens, step_text, last_tok = self._generate_step(
+                branch_caches, node.seed_token
+            )
             is_terminal = self._is_answer(step_text)
             child = MCTSNode(
                 caches=branch_caches,
                 tokens=step_tokens,
                 text=step_text,
+                seed_token=last_tok,
                 parent=node,
                 depth=node.depth + 1,
                 is_terminal=is_terminal,
@@ -220,6 +234,15 @@ class MCTSTree:
                 best = node
             stack.extend(node.children)
         return best
+
+    def set_root_seed(self, seed_token: int):
+        """Set the seed token on the root node after prefill.
+
+        Args:
+            seed_token: The first generated token from the prefill step.
+                        This seeds the first expand() call.
+        """
+        self.root.seed_token = seed_token
 
     def search(
         self,
@@ -263,38 +286,47 @@ class MCTSTree:
     def _generate_step(
         self,
         caches: list,
-    ) -> tuple[list[int], str]:
-        """Generate tokens until a step boundary or max_step_tokens.
+        seed_token: int,
+    ) -> tuple[list[int], str, int]:
+        """Generate tokens for one reasoning step.
+
+        seed_token is the last token from the parent's generation. It hasn't
+        been processed into the cache yet, so we pass it as the prompt —
+        stream_generate will process it and generate continuations from it.
 
         Args:
             caches: KV cache list (modified in place by generation).
+            seed_token: First token to feed; seeds the continuation.
 
         Returns:
-            (tokens, text) for the generated step.
+            (tokens, text, last_token) for the generated step.
         """
+        from mlx_lm.sample_utils import make_sampler
+
         tokens = []
         text_pieces = []
+        last_token = seed_token
 
         for response in mlx_lm.stream_generate(
             self.model,
             self.tokenizer,
-            prompt=[],                     # continue from cache
+            prompt=[seed_token],
             max_tokens=self.max_step_tokens,
-            temp=self.temperature,
+            sampler=make_sampler(temp=self.temperature),
             prompt_cache=caches,
         ):
             tokens.append(response.token)
             text_pieces.append(response.text)
+            last_token = response.token
             if response.finish_reason:
                 break
-            # Step boundary detection
             accumulated = "".join(text_pieces)
             if any(marker in accumulated for marker in self.step_end_tokens):
                 break
             if len(tokens) >= self.max_step_tokens:
                 break
 
-        return tokens, "".join(text_pieces)
+        return tokens, "".join(text_pieces), last_token
 
     def _is_answer(self, text: str) -> bool:
         """Detect if a step contains a final answer."""
@@ -320,26 +352,28 @@ def draft_logprob_evaluator(draft_model, tokenizer) -> Callable[[MCTSNode], floa
     """
     def _evaluate(node: MCTSNode) -> float:
         if not node.tokens:
-            return 0.0
-        text = node.full_text
-        prompt_tokens = tokenizer.encode(text)
-        # Score last step only: use log-probs from a single forward pass
-        # Run one forward pass, extract log-probs for the step tokens
-        total_lp = 0.0
-        count = 0
-        for response in mlx_lm.stream_generate(
-            draft_model,
-            tokenizer,
-            prompt=prompt_tokens[:-len(node.tokens)],
-            max_tokens=len(node.tokens),
-        ):
-            if response.logprobs is not None:
-                total_lp += float(response.logprobs.max())
-                count += 1
-        if count == 0:
             return 0.5
-        # Map mean log-prob in [-10, 0] → [0, 1]
-        mean_lp = total_lp / count
-        return max(0.0, min(1.0, (mean_lp + 10.0) / 10.0))
+        text = node.full_text
+        if not text.strip():
+            return 0.5
+        try:
+            import mlx.nn as nn
+            from mlx_lm.models.cache import make_prompt_cache
+
+            all_tokens = tokenizer.encode(text)
+            if len(all_tokens) < 2:
+                return 0.5
+            # Single forward pass over context; score the last node token
+            input_ids = mx.array(all_tokens[:-1])[None]
+            target_id = all_tokens[-1]
+            tmp_cache = make_prompt_cache(draft_model)
+            logits = draft_model(input_ids, cache=tmp_cache)
+            last_logits = logits[0, -1, :]
+            log_probs = nn.log_softmax(last_logits)
+            score_lp = float(log_probs[target_id].item())
+            # Map log-prob in [-10, 0] → [0, 1]
+            return max(0.0, min(1.0, (score_lp + 10.0) / 10.0))
+        except Exception:
+            return 0.5
 
     return _evaluate

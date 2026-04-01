@@ -42,7 +42,8 @@ def parse_args():
 
 def run_generation(model, tokenizer, draft_model, cache, n_tokens, label):
     """Run one generation pass and return (tok/s, n_tokens_generated)."""
-    gen_kwargs = dict(max_tokens=n_tokens, temp=0.0, prompt_cache=cache)
+    from mlx_lm.sample_utils import make_sampler
+    gen_kwargs = dict(max_tokens=n_tokens, sampler=make_sampler(temp=0.0), prompt_cache=cache)
     if draft_model:
         gen_kwargs["draft_model"] = draft_model
         gen_kwargs["num_draft_tokens"] = 4
@@ -93,23 +94,23 @@ def main():
     for run in range(args.n_runs):
         print(f"\n--- Run {run+1}/{args.n_runs} ---")
 
+        from mlx_lm.models.cache import make_prompt_cache
+
         if not args.skip_baseline:
-            from mlx_lm import cache as mlx_cache
-            baseline_cache = mlx_cache.make_prompt_cache(model)
+            baseline_cache = make_prompt_cache(model)
             tps, _ = run_generation(model, tokenizer, None, baseline_cache,
                                     args.n_tokens, "baseline (no spec, FP16)")
             results["baseline"].append(tps)
 
-        from mlx_lm import cache as mlx_cache
-        spec_cache = mlx_cache.make_prompt_cache(model)
-        draft_cache = mlx_cache.make_prompt_cache(draft_model)
+        spec_cache = make_prompt_cache(model)
+        draft_cache = make_prompt_cache(draft_model)
         combined = spec_cache + draft_cache
         tps, _ = run_generation(model, tokenizer, draft_model, combined,
                                 args.n_tokens, "spec decoding (FP16 KV)")
         results["spec_only"].append(tps)
 
         pq_cache = make_fused_cache(model, bits=args.bits, boundary_layers=2)
-        draft_cache2 = mlx_cache.make_prompt_cache(draft_model)
+        draft_cache2 = make_prompt_cache(draft_model)
         combined_pq = pq_cache + draft_cache2
         tps, _ = run_generation(model, tokenizer, draft_model, combined_pq,
                                 args.n_tokens, f"spec + PolarQuant ({args.bits}-bit KV)")

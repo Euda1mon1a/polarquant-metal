@@ -85,8 +85,8 @@ class ModelState:
         # Warm up: single forward pass to force weight loading into GPU memory
         logger.info("Warming up model weights...")
         warm_tokens = mx.array([[1, 2, 3]])
-        from mlx_lm import cache as mlx_cache
-        warm_cache = mlx_cache.make_prompt_cache(self.model)
+        from mlx_lm.models.cache import make_prompt_cache
+        warm_cache = make_prompt_cache(self.model)
         _ = self.model(warm_tokens, cache=warm_cache)
         mx.metal.clear_cache()
 
@@ -150,17 +150,24 @@ def create_app(state: ModelState = None) -> FastAPI:
 
 
 def _build_gen_kwargs(request: ChatCompletionRequest) -> tuple[list, dict]:
-    """Build prompt_cache and generation kwargs for a request."""
+    """Build prompt_cache and generation kwargs for a request.
+
+    generate_step accepts temp/top_p directly.
+    speculative_generate_step requires a sampler callable — stream_generate
+    strips temp/top_p and raises when draft_model is set. We always pass
+    sampler= to be safe for both paths.
+    """
+    from mlx_lm.sample_utils import make_sampler
+    sampler = make_sampler(temp=request.temperature, top_p=request.top_p)
     main_cache = _state.make_cache()
 
     if _state.draft_model is not None:
-        from mlx_lm import cache as mlx_cache
-        draft_cache = mlx_cache.make_prompt_cache(_state.draft_model)
+        from mlx_lm.models.cache import make_prompt_cache
+        draft_cache = make_prompt_cache(_state.draft_model)
         combined_cache = main_cache + draft_cache
         kwargs = dict(
             max_tokens=request.max_tokens,
-            temp=request.temperature,
-            top_p=request.top_p,
+            sampler=sampler,
             prompt_cache=combined_cache,
             draft_model=_state.draft_model,
             num_draft_tokens=_state.num_draft_tokens,
@@ -169,8 +176,7 @@ def _build_gen_kwargs(request: ChatCompletionRequest) -> tuple[list, dict]:
 
     kwargs = dict(
         max_tokens=request.max_tokens,
-        temp=request.temperature,
-        top_p=request.top_p,
+        sampler=sampler,
         prompt_cache=main_cache,
     )
     return main_cache, kwargs
