@@ -94,6 +94,11 @@ class TurboQuantKVCache:
         self._rigidity_skips = 0
         self._rigidity_total = 0
 
+        # Entropy amortization (Exp 6): recompute every N steps, cache between
+        self.entropy_recompute_interval = 50
+        self._entropy_step_counter = 0
+        self._cached_thresholds = None
+
     def _init(self, head_dim):
         """Lazy initialization once we know head_dim."""
         self._head_dim = head_dim
@@ -340,12 +345,17 @@ class TurboQuantKVCache:
         # Softmax
         weights = mx.softmax(scores, axis=-1, precise=True)
 
-        # Entropy-guided adaptive sparse V threshold (Phase 1)
-        # For long contexts, compute attention entropy to decide pruning level.
-        # Short contexts or disabled sparse_v skip the entropy computation entirely.
+        # Entropy-guided adaptive sparse V threshold (Phase 1 + Exp 6 amortization)
+        # Compute per-head entropy every N steps, cache between. Exp 6 showed
+        # thresholds are regime-robust: zero quality loss at interval=50.
         L_kv = weights.shape[-1]
         if self.sparse_v_threshold > 0 and L_kv > 1024:
-            adaptive_threshold = self._compute_adaptive_threshold(weights)
+            self._entropy_step_counter += 1
+            if (self._cached_thresholds is None
+                    or self._entropy_step_counter >= self.entropy_recompute_interval):
+                self._cached_thresholds = self._compute_adaptive_threshold(weights)
+                self._entropy_step_counter = 0
+            adaptive_threshold = self._cached_thresholds
         else:
             adaptive_threshold = self.sparse_v_threshold
 
