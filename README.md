@@ -85,6 +85,23 @@ response = mlx_lm.generate(model, tokenizer, prompt="...", prompt_cache=cache)
 | 600+ tokens | 0.97x | 4.6x compressed |
 | Decode at 2K | 2.0x vs naive dequant | 4.6x compressed |
 
+### Adaptive Optimizations (Phase 2, 2026-03-31)
+
+Two runtime optimizations that activate automatically on long contexts:
+
+**Entropy-guided sparse V** — per-head adaptive pruning in the SV kernel:
+- Computes Shannon entropy of attention weights per head after softmax
+- Concentrated heads (low entropy) → aggressive threshold, skip ~99% of value lookups
+- Spread heads (high entropy) → threshold disabled, full computation
+- 3x SV kernel speedup on concentrated heads, zero quality loss on spread heads
+- Activates at >1024 tokens (97% of production requests)
+
+**Rigidity gate** — skip redundant KV quantization during decode:
+- Compares consecutive tokens' rotated unit vectors via cosine similarity
+- When rigidity > 0.90 (tokens would produce ~identical codebook indices), reuses previous packed indices with updated norm only
+- 78% skip rate on flowing text, 0% on topic changes (correctly gated)
+- `cache.rigidity_stats` for observability
+
 ## Integration with mlx-turboquant
 
 ```python
@@ -113,13 +130,25 @@ python benchmarks/bench_fused_vs_naive.py
 ```
 polarquant_metal/
 ├── __init__.py              # Public API
-├── kernels.py               # Metal kernel source + Python wrappers
+├── kernels.py               # Metal kernel source + Python wrappers (per-head sparse_thresh[])
 ├── cache.py                 # FusedPolarQuantKVCache
+├── turboquant_cache.py      # TurboQuantKVCache (entropy gate + rigidity gate)
 ├── polar_quant.py           # PolarQuant quantizer (rotation + codebooks)
 ├── packing.py               # Bit-packing utilities
 ├── codebooks.py             # Lloyd-Max codebooks (hardcoded, no file dependency)
 ├── integration.py           # mlx-lm SDPA monkey-patch
 └── mlx_turboquant_adapter.py # Drop-in for rachittshah/mlx-turboquant
+
+benchmarks/
+├── bench_fused_vs_naive.py        # Core benchmark (decode + prefill, bit widths)
+├── stress_test_long_context.py    # 16K-32K decode stress test
+├── exp1_entropy_sparse_v.py       # Experiment 1: entropy-guided threshold
+├── exp2_rigidity_gate.py          # Experiment 2: anti-churn rigidity
+├── exp3_stroboscopic_drift.py     # Experiment 3: drift detection (negative result)
+├── exp4_spectral_bitwidth.py      # Experiment 4: per-head bit-width (negative result)
+├── EXPERIMENTS.md                 # Consolidated experiment findings
+├── STRESS_RESULTS.md              # 16K-32K results
+└── EXP[1-4]_RESULTS.md            # Individual experiment results
 ```
 
 ## How the Metal Kernels Work
@@ -187,7 +216,19 @@ None. Koa's text-router sends standard OpenAI-compatible requests. PolarQuant is
 
 3. **Model-dependent quality** — Llama-3.2-3B and Qwen3.5-35B produce correct output. Phi-4-Mini degrades (PolarQuant itself produces low cosine similarity on this architecture — same issue in upstream PR #1059).
 
-4. **SV kernel is the bottleneck** — 47% of time at 2K tokens. Tiled SV and simd_broadcast_first were both tested and found slower than the simple per-element kernel (Metal L1 cache handles broadcast efficiently). Pre-combined weight*norm optimization gives 25% improvement.
+4. **SV kernel is the bottleneck** — 47% of time at 2K tokens, 88% at 32K. Tiled SV and simd_broadcast_first were both tested and found slower than the simple per-element kernel (Metal L1 cache handles broadcast efficiently). Pre-combined weight*norm optimization gives 25% improvement. Entropy-guided Sparse V (Phase 2) mitigates this for concentrated heads.
+
+## Negative Results (things we tested that didn't work)
+
+Documented here for completeness. See `benchmarks/EXPERIMENTS.md` for full data.
+
+1. **Stroboscopic FP16 drift detection** — Hypothesis: quantization error accumulates over long contexts. Result: **No drift.** Cosine similarity stays >0.998 across 16K tokens. Re-quantizing from FP16 ground truth produces byte-identical output. Law of large numbers: softmax averaging dilutes per-token errors as context grows. Conclusion: no recalibration mechanism needed.
+
+2. **Spectral bit-width selection** — Hypothesis: heads with periodic attention patterns tolerate 2-bit quantization. Result: **No pattern survived 2-bit.** PolarQuant's random orthogonal rotation decorrelates signals before quantization, making error pattern-independent. The best 2-bit cosine similarity was 0.946 (periodic-64), below the 0.95 safety threshold. Uniform 3-bit is the correct default.
+
+3. **Adaptive codebook learning (stigmergy)** — Hypothesis: online codebook adaptation via usage-frequency reinforcement. Result: **Not novel.** This is standard online k-means / EMA codebook updates (VQ-VAE, 1967). Additionally, PolarQuant's rotation makes distributions approximately Gaussian, for which Lloyd-Max is already optimal. Would not improve quality.
+
+4. **Fixed sparse_v_threshold** — A uniform threshold of 0.01 achieves 3x speedup on concentrated heads but **destroys** spread heads (cosine sim = 0.000). This motivated the entropy-guided approach (Experiment 1), which correctly disables pruning for high-entropy heads.
 
 ## Prior Art & Novel Contributions
 
@@ -207,9 +248,11 @@ Novelty assessment via Perplexity deep research (2026-03-31).
 1. **Fused SV kernel** -- scores@V directly from packed codebook indices on Metal. No public Metal implementation exists.
 2. **Sparse V on Apple Silicon** -- threshold-based skipping of near-zero attention positions in Metal kernel. SpargeAttn exists on CUDA but has no Metal port.
 3. **Asymmetric K/V in MLX ecosystem** -- different bitwidths for K vs V caches. Nothing in the MLX ecosystem uses this.
-4. **Combined pipeline** -- fused bidirectional attention + Sparse V + asymmetric K/V + adaptive lazy threshold on M4 Pro. "Unambiguously novel" as an integrated system.
+4. **Entropy-guided per-head adaptive Sparse V** -- per-head Shannon entropy gates pruning threshold at runtime. Concentrated heads pruned aggressively, spread heads protected. No prior work applies entropy-gated sparse attention to Metal/MLX codebook kernels.
+5. **Rigidity-gated quantization skip** -- cosine similarity of rotated unit vectors detects redundant KV entries and skips quantize+pack. Novel application of anti-churn metrics to KV cache compression.
+6. **Combined pipeline** -- fused bidirectional attention + adaptive Sparse V + rigidity gate + asymmetric K/V + lazy threshold on M4 Pro. "Unambiguously novel" as an integrated system.
 
-**Result:** 75.3 tok/s vs 71.4 tok/s standard (5% faster than FP16 with 8x KV cache compression).
+**Result:** 75.3 tok/s vs 71.4 tok/s standard (5% faster than FP16 with 8x KV cache compression). Phase 2 adds per-head adaptive gains on top.
 
 ### Key References
 
