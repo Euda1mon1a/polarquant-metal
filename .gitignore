@@ -5,3 +5,4 @@ __pycache__/
 dist/
 build/
 .eggs/
+benchmarks/GEMMA4_BENCH_*.json

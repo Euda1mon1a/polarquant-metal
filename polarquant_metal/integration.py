@@ -106,32 +106,47 @@ def adaptive_threshold(default: int = 512, context_file: str = None) -> int:
     return default
 
 
+def _is_gemma4(model) -> bool:
+    """Detect Gemma 4 architecture by checking for layer_type attribute."""
+    if not hasattr(model, 'layers') or len(model.layers) == 0:
+        return False
+    return hasattr(model.layers[0], 'layer_type')
+
+
 def make_fused_cache(model, bits: int = 3, bits_v: int = None,
                      boundary_layers: int = 2,
                      min_fused_context: int = 512) -> list:
     """Create cache instances for each layer and patch SDPA.
 
-    For hybrid models (e.g. Qwen3.5) that mix standard and linear attention,
-    only standard attention layers get TurboQuantKVCache. Linear attention
-    layers keep their native ArraysCache.
+    Supports three model architectures:
+    - Qwen3.5 hybrid (standard + linear attention)
+    - Gemma 4 (full_attention + sliding_attention + KV-shared layers)
+    - Standard dense models (all layers get TurboQuantKVCache)
 
-    Boundary layer protection: first N and last N standard attention layers
+    Boundary layer protection: first N and last N PolarQuant-eligible layers
     use FP16 KVCache (no quantization) to preserve quality at the layers
     that matter most. Middle layers get asymmetric K/V compression.
 
     Args:
-        model: mlx-lm model (must have .layers)
+        model: mlx-lm/mlx-vlm model (must have .layers)
         bits: PolarQuant bits for K (default 3)
         bits_v: PolarQuant bits for V (default same as bits). Lower is
             safe because Sparse V skips near-zero positions.
-        boundary_layers: number of first/last standard attention layers
+        boundary_layers: number of first/last PQ-eligible layers
             to keep at FP16 (default 2). Set to 0 to compress all.
+        min_fused_context: token count before lazy quantization kicks in.
 
     Returns:
         List of caches, one per layer
     """
     from mlx_lm.models.cache import KVCache
     patch_sdpa()
+
+    if _is_gemma4(model):
+        return _make_gemma4_cache(model, bits, bits_v, boundary_layers,
+                                  min_fused_context)
+
+    # --- Original path: Qwen3.5 / standard models ---
 
     # Identify standard attention layer indices
     std_indices = [i for i, l in enumerate(model.layers)
@@ -153,4 +168,89 @@ def make_fused_cache(model, bits: int = 3, bits_v: int = None,
         else:
             caches.append(TurboQuantKVCache(bits=bits, bits_v=bits_v, fused=True,
                                             min_fused_context=min_fused_context))
+    return caches
+
+
+def _make_gemma4_cache(model, bits, bits_v, boundary_layers,
+                       min_fused_context) -> list:
+    """Create PolarQuant cache for Gemma 4 architecture.
+
+    Gemma 4 has three layer types requiring different cache strategies:
+    1. full_attention — unbounded context, PolarQuant candidates
+    2. sliding_attention — RotatingKVCache (fixed window), skip PQ
+    3. KV-shared layers — reuse K/V from a source layer, just track offset
+
+    Only non-shared full_attention layers benefit from PolarQuant
+    compression, since those are the ones that accumulate unbounded KV
+    state over long contexts.
+    """
+    from mlx_lm.models.cache import KVCache
+
+    # RotatingKVCache for sliding window layers
+    RotatingKVCache = None
+    try:
+        from mlx_vlm.models.cache import RotatingKVCache
+    except ImportError:
+        try:
+            from mlx_lm.models.cache import RotatingKVCache
+        except ImportError:
+            pass
+
+    # Identify PQ-eligible layers: full_attention AND not KV-shared
+    pq_eligible = []
+    for i, layer in enumerate(model.layers):
+        is_full = getattr(layer, 'layer_type', '') == 'full_attention'
+        attn = getattr(layer, 'self_attn', None)
+        is_shared = getattr(attn, 'is_kv_shared_layer', False) if attn else False
+        if is_full and not is_shared:
+            pq_eligible.append(i)
+
+    n_eligible = len(pq_eligible)
+
+    # Boundary protection on eligible layers
+    boundary_set = set()
+    if boundary_layers > 0 and n_eligible > 2 * boundary_layers:
+        boundary_set = set(
+            pq_eligible[:boundary_layers] + pq_eligible[-boundary_layers:]
+        )
+
+    # Get sliding window size from first sliding layer
+    sliding_window = 512  # default
+    for layer in model.layers:
+        if getattr(layer, 'layer_type', '') == 'sliding_attention':
+            config = getattr(layer, 'config', None)
+            if config and hasattr(config, 'sliding_window'):
+                sliding_window = config.sliding_window
+            break
+
+    caches = []
+    pq_count = 0
+    for i, layer in enumerate(model.layers):
+        layer_type = getattr(layer, 'layer_type', 'full_attention')
+        attn = getattr(layer, 'self_attn', None)
+        is_shared = getattr(attn, 'is_kv_shared_layer', False) if attn else False
+
+        if layer_type == 'sliding_attention':
+            # Sliding window — RotatingKVCache, PQ incompatible
+            if RotatingKVCache is not None:
+                caches.append(RotatingKVCache(max_size=sliding_window, keep=0))
+            else:
+                caches.append(KVCache())
+        elif is_shared:
+            # KV-shared layer — never calls update_and_fetch, just offset
+            caches.append(KVCache())
+        elif i in boundary_set:
+            # Boundary full_attention — FP16 for quality
+            caches.append(KVCache())
+        elif i in pq_eligible:
+            # Core full_attention — PolarQuant compressed
+            caches.append(TurboQuantKVCache(
+                bits=bits, bits_v=bits_v, fused=True,
+                min_fused_context=min_fused_context,
+            ))
+            pq_count += 1
+        else:
+            # Fallback
+            caches.append(KVCache())
+
     return caches
