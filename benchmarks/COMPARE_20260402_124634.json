@@ -1,0 +1,78 @@
+{
+  "gemma4_pq": [
+    {
+      "model": "gemma4-4bit+PQ",
+      "label": "Medical \u2014 direct",
+      "tps": 26.7,
+      "elapsed": 4.1,
+      "response": "Metformin lowers blood glucose primarily by targeting the liver and skeletal muscle through the following mechanisms:\n\n*   **Inhibition of Hepatic Gluconeogenesis:** Activates AMP-activated protein kinase (AMPK), which suppresses the expression of gluconeogenic genes, reducing the liver's production of glucose.\n*   **Increase in Insulin Sensitivity:** Enhances glucose uptake and utilization by skeletal muscle cells by increasing the translocation of GLUT4 transporters to the cell membrane.\n*   **Reduction of Int"
+    },
+    {
+      "model": "gemma4-4bit+PQ",
+      "label": "Medical \u2014 clinical nuance",
+      "tps": 26.6,
+      "elapsed": 4.9,
+      "response": "Choose metformin over an SGLT2 inhibitor as first-line therapy in the following scenarios:\n\n*   **Cost and Access:** Metformin is significantly cheaper and typically has better insurance coverage/formulary placement.\n*   **Weight Stability:** In patients where weight loss is not a primary goal or is potentially detrimental.\n*   **Lack of High-Risk Comorbidities:** In patients without established atherosclerotic cardiovascular disease (ASCVD), heart failure (HFrEF), or chronic kidney disease (CKD), where the specific organ-protective benefits of SGLT2 inhibitors are less"
+    },
+    {
+      "model": "gemma4-4bit+PQ",
+      "label": "Document synthesis \u2014 HPE",
+      "tps": 11.8,
+      "elapsed": 9.0,
+      "response": "**Thesis Direction:**\nThe impact of a privacy-preserving, on-premise clinical AI assistant on trainee information-seeking behavior, efficiency (time-to-answer), and confidence.\n\n**The Critical Success/Failure Factor:**\n**User Adoption/Engagement:** Because the technical infrastructure (MedGemma, semantic search, routing) is already functional, the project's success depends entirely on whether trainees actually integrate the tool into their workflow enough to generate statistically significant behavioral data."
+    },
+    {
+      "model": "gemma4-4bit+PQ",
+      "label": "Cross-document connection",
+      "tps": 10.2,
+      "elapsed": 13.1,
+      "response": "**Architectural Lesson:** Relying on unstable external record IDs (Airtable) for state management creates systemic brittleness and \"ID-staleness\" bugs.\n\n**Current Status:**\nThe Postgres/FastAPI stack resolves the core technical issue (ID stability and relational integrity), but the underlying problem of **state persistence** remains: while the *mechanism* for storing state is now stable, the logic governing how the AI agent interprets and updates that state across sessions still requires rigorous schema enforcement to avoid logical drift."
+    },
+    {
+      "model": "gemma4-4bit+PQ",
+      "label": "Self-assessment reflection",
+      "tps": 11.7,
+      "elapsed": 1.8,
+      "response": "The structural difference is the presence of **real users**."
+    }
+  ],
+  "qwen35_pq": [
+    {
+      "model": "qwen35+PQ",
+      "label": "Medical \u2014 direct",
+      "tps": 63.9,
+      "elapsed": 1.6,
+      "response": "<think>Thinking Process:\n\n1.  **Analyze the Request:**\n    *   **Topic:** Mechanism of action (MOA) of metformin in type 2 diabetes.\n    *   **Persona:** Knowledgeable assistant working with a board-certified family medicine physician who builds software systems.\n    *   **Constraints:** Direct, accurate answers. No medical disclaimers. No suggesting consulting a doctor. No unnecessary hedging. Concise. Prefer bullet points over paragraphs."
+    },
+    {
+      "model": "qwen35+PQ",
+      "label": "Medical \u2014 clinical nuance",
+      "tps": 75.1,
+      "elapsed": 1.6,
+      "response": "<think>Thinking Process:\n\n1.  **Analyze the Request:**\n    *   **User Role:** Board-certified family medicine physician who also builds software systems (implies a preference for logic, structure, efficiency, and evidence-based decision-making).\n    *   **My Role:** Knowledgeable assistant.\n    *   **Task:** Explain when to choose metformin over an SGLT2 inhibitor as first-line in new Type 2 Diabetes Mellitus (T2DM) diagnosis.\n    *   **Constraints:** Direct, accurate answers. No medical disclaimers. No"
+    },
+    {
+      "model": "qwen35+PQ",
+      "label": "Document synthesis \u2014 HPE",
+      "tps": 68.5,
+      "elapsed": 2.9,
+      "response": "<think>Thinking Process:\n\n1.  **Analyze the Request:**\n    *   **User:** Board-certified family medicine physician who builds software systems.\n    *   **Task:** Identify the single most defensible MHPE (Medical Humanistic/Professional/Health Professions Education) thesis direction from the provided document excerpt and identify the single critical success/failure factor.\n    *   **Constraints:** Direct, accurate answers. No medical disclaimers. No suggesting consulting a doctor. No hedging. Concise. Prefer bullet points.\n    *   **Source Material:** A project summary for \"Dr. Shapiro (HPE)\" containing details about a fetal presentation ultrasound simulator, a self-hosted AI assistant (MedGemma), and an encrypted XGBoost inference project.\n\n2.  **Analyze the Document Excerpt:**\n    *   **Project 1: Fetal Presentation Ultrasound Simulator.**\n        *   Goal: POCUS training for military (deploy"
+    },
+    {
+      "model": "qwen35+PQ",
+      "label": "Cross-document connection",
+      "tps": 64.3,
+      "elapsed": 3.1,
+      "response": "<think>Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Input: Two document excerpts (DOC 1: Architecture Evolution, DOC 2: Schema Evolution).\n    *   Task: Identify the single deepest architectural lesson from the Airtable+n8n era (one sentence). Then, determine if the current Postgres/FastAPI stack fully resolves it or if a version remains.\n    *   Constraints: Direct, accurate answers. No medical disclaimers. No hedging. Concise. Prefer bullet points.\n\n2.  **Analyze DOC 1 (Architecture Evolution):**\n    *   Timeline: Jun 2025 to Apr 2026.\n    *   Evolution: Monolith -> \"THIS IS THE ONE\" -> HTTP Nodes v7.0 -> Clean 9-phase -> Orchestrator.\n    *   Core Issue: \"Airtable record IDs are unstable across sessions.\"\n    *   Consequence:"
+    },
+    {
+      "model": "qwen35+PQ",
+      "label": "Self-assessment reflection",
+      "tps": 65.6,
+      "elapsed": 2.3,
+      "response": "<think>Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Source Material: A provided text snippet titled \"Project Summary \u2014 Dr. Shapiro (HPE)\".\n    *   Task: Identify the structural difference between the finished projects (AAPM, weather model) and the unfinished ones (fetal presentation ultrasound simulator, self-hosted AI assistant, encrypted XGBoost inference) that explains why the former got finished.\n    *   Constraint: Direct, accurate answers. No medical disclaimers. No hedging. Concise. Prefer bullet points.\n\n2.  **Analyze the Source Text:**\n    *   Project 1: Fetal presentation ultrasound simulator (HPE fit). Status: \"No hardware"
+    }
+  ],
+  "mini_url": "http://127.0.0.1:18080",
+  "qwen_model_id": "mlx-community/Qwen3.5-35B-A3B-4bit"
+}

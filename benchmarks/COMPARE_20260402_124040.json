@@ -1,0 +1,42 @@
+{
+  "gemma4_pq": [
+    {
+      "model": "gemma4-4bit+PQ",
+      "label": "Medical \u2014 direct",
+      "tps": 26.8,
+      "elapsed": 4.1,
+      "response": "Metformin lowers blood glucose primarily by targeting the liver and skeletal muscle through the following mechanisms:\n\n*   **Inhibition of Hepatic Gluconeogenesis:** Activates AMP-activated protein kinase (AMPK), which suppresses the expression of gluconeogenic genes, reducing the liver's production of glucose.\n*   **Increase in Insulin Sensitivity:** Enhances glucose uptake and utilization by skeletal muscle cells by increasing the translocation of GLUT4 transporters to the cell membrane.\n*   **Reduction of Int"
+    },
+    {
+      "model": "gemma4-4bit+PQ",
+      "label": "Medical \u2014 clinical nuance",
+      "tps": 26.1,
+      "elapsed": 5.0,
+      "response": "Choose metformin over an SGLT2 inhibitor as first-line therapy in the following scenarios:\n\n*   **Cost and Access:** Metformin is significantly cheaper and typically has better insurance coverage/formulary placement.\n*   **Weight Stability:** In patients where weight loss is not a primary goal or is potentially detrimental.\n*   **Lack of High-Risk Comorbidities:** In patients without established atherosclerotic cardiovascular disease (ASCVD), heart failure (HFrEF), or chronic kidney disease (CKD), where the specific organ-protective benefits of SGLT2 inhibitors are less"
+    },
+    {
+      "model": "gemma4-4bit+PQ",
+      "label": "Document synthesis \u2014 HPE",
+      "tps": 11.4,
+      "elapsed": 9.3,
+      "response": "**Thesis Direction:**\nThe impact of a privacy-preserving, on-premise clinical AI assistant on trainee information-seeking behavior, efficiency (time-to-answer), and confidence.\n\n**The Critical Success/Failure Factor:**\n**User Adoption/Engagement:** Because the technical infrastructure (MedGemma, semantic search, routing) is already functional, the project's success depends entirely on whether trainees actually integrate the tool into their workflow enough to generate statistically significant behavioral data."
+    },
+    {
+      "model": "gemma4-4bit+PQ",
+      "label": "Cross-document connection",
+      "tps": 10.2,
+      "elapsed": 13.6,
+      "response": "**Architectural Lesson:** Relying on unstable external record IDs (Airtable) for state management creates systemic brittleness and \"ID-staleness\" bugs.\n\n**Current Status:**\nThe Postgres/FastAPI stack resolves the core technical issue (ID stability and relational integrity), but the underlying problem of **state persistence** remains: while the *mechanism* for storing state is now stable, the logic governing how the AI agent interprets and updates that state across sessions still requires rigorous schema enforcement to avoid logical drift."
+    },
+    {
+      "model": "gemma4-4bit+PQ",
+      "label": "Self-assessment reflection",
+      "tps": 11.9,
+      "elapsed": 1.7,
+      "response": "The structural difference is the presence of **real users**."
+    }
+  ],
+  "qwen35_pq": null,
+  "mini_url": "http://192.168.4.202:8080",
+  "qwen_model_id": null
+}

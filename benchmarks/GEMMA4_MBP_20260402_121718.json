@@ -1,0 +1,96 @@
+{
+  "4bit": {
+    "variant": "4BIT",
+    "model": "mlx-community/gemma-4-31b-it-4bit",
+    "load_s": 1684.2,
+    "mem_active_gb": 17.16,
+    "mem_peak_gb": 17.41,
+    "swap_delta_mb": -40.0,
+    "swap_final_mb": 935.8,
+    "avg_tok_s": 28.8,
+    "trials_tok_s": [
+      28.6,
+      28.9,
+      28.8
+    ],
+    "quality": [
+      {
+        "tag": "Conciseness",
+        "q": "In one sentence, what is the difference between TCP and UDP?",
+        "a": "TCP is a connection-oriented protocol that ensures reliable, ordered delivery of data through error-checking and acknowledgments, whereas UDP is a connectionless protocol that prioritizes speed and efficiency by sending data without verifying if it was received.",
+        "tps": 29.1
+      },
+      {
+        "tag": "Reasoning",
+        "q": "A farmer has 17 sheep. All but 9 die. How many sheep are left?",
+        "a": "There are **9** sheep left.   The phrase \"all but 9 die\" means that 9 survived.",
+        "tps": 29.5
+      },
+      {
+        "tag": "Medical",
+        "q": "What is the mechanism of action of metformin?",
+        "a": "*Disclaimer: I am an AI, not a doctor. This information is for educational purposes and should not be taken as medical advice.*  Metformin is a biguanide antihyperglycemic agent. Unlike sulfonylureas, it does not stimulate the pancreas to release more insulin; instead, it focuses on making the body more sensitive to the insulin already present and reducing the amount of glucose produced",
+        "tps": 28.6
+      },
+      {
+        "tag": "Code",
+        "q": "Write a Python one-liner to flatten a list of lists.",
+        "a": "The most efficient and common way to do this is using a **nested list comprehension**:  ```python flattened = [item for sublist in data for item in sublist] ```  ### Example: ```python data = [[1, 2], [3, 4], [5, 6]] flattened = [item for sublist in data for item",
+        "tps": 28.6
+      },
+      {
+        "tag": "Routing",
+        "q": "What time is it right now?",
+        "a": "Since I am an AI, I don't have a physical location, but according to Coordinated Universal Time (UTC), it is currently **[Insert Current UTC Time]**.  To give you the exact time for your specific location, please let me know your **city or time zone**!",
+        "tps": 28.8
+      }
+    ]
+  },
+  "8bit": {
+    "variant": "8BIT",
+    "model": "mlx-community/gemma-4-31b-it-8bit",
+    "load_s": 3757.6,
+    "mem_active_gb": 31.45,
+    "mem_peak_gb": 31.7,
+    "swap_delta_mb": 0.0,
+    "swap_final_mb": 935.8,
+    "avg_tok_s": 15.6,
+    "trials_tok_s": [
+      15.8,
+      15.7,
+      15.4
+    ],
+    "quality": [
+      {
+        "tag": "Conciseness",
+        "q": "In one sentence, what is the difference between TCP and UDP?",
+        "a": "TCP is a connection-oriented protocol that ensures reliable, ordered delivery of data through error-checking and acknowledgments, whereas UDP is a connectionless protocol that prioritizes speed and efficiency by sending data without guaranteeing delivery.",
+        "tps": 15.4
+      },
+      {
+        "tag": "Reasoning",
+        "q": "A farmer has 17 sheep. All but 9 die. How many sheep are left?",
+        "a": "There are **9** sheep left.",
+        "tps": 17.1
+      },
+      {
+        "tag": "Medical",
+        "q": "What is the mechanism of action of metformin?",
+        "a": "Metformin is a biguanide antihyperglycemic agent. Unlike sulfonylureas, it does not stimulate insulin secretion; instead, it focuses on improving how the body handles existing insulin and reducing the amount of glucose entering the bloodstream.  Its mechanism of action is complex and occurs primarily in the **liver**, **muscles**, and **intestines**.  ### 1. Inhibition of Hep",
+        "tps": 15.4
+      },
+      {
+        "tag": "Code",
+        "q": "Write a Python one-liner to flatten a list of lists.",
+        "a": "The most efficient and common way to flatten a list of lists in Python is using a **list comprehension**:  ```python flat_list = [item for sublist in nested_list for item in sublist] ```  ### Example: ```python nested_list = [[1, 2], [3, 4], [5, 6]] flat_list",
+        "tps": 15.4
+      },
+      {
+        "tag": "Routing",
+        "q": "What time is it right now?",
+        "a": "I do not have access to your local time zone or a real-time clock. Please check your device's clock for the current time.",
+        "tps": 15.8
+      }
+    ]
+  }
+}

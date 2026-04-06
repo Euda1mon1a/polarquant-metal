@@ -1,0 +1,42 @@
+{
+  "gemma4_pq": null,
+  "qwen35_pq": [
+    {
+      "model": "qwen35+PQ",
+      "label": "Medical \u2014 direct",
+      "tps": 60.0,
+      "elapsed": 1.7,
+      "response": "<think>Thinking Process:\n\n1.  **Analyze the Request:**\n    *   **Topic:** Mechanism of action (MOA) of metformin in type 2 diabetes.\n    *   **Persona:** Knowledgeable assistant working with a board-certified family medicine physician who builds software systems.\n    *   **Constraints:** Direct, accurate answers. No medical disclaimers. No suggesting consulting a doctor. No unnecessary hedging. Concise. Prefer bullet points over paragraphs."
+    },
+    {
+      "model": "qwen35+PQ",
+      "label": "Medical \u2014 clinical nuance",
+      "tps": 73.0,
+      "elapsed": 1.6,
+      "response": "<think>Thinking Process:\n\n1.  **Analyze the Request:**\n    *   **User Role:** Board-certified family medicine physician who also builds software systems (implies a preference for logic, structure, efficiency, and evidence-based decision-making).\n    *   **My Role:** Knowledgeable assistant.\n    *   **Task:** Explain when to choose metformin over an SGLT2 inhibitor as first-line in new Type 2 Diabetes Mellitus (T2DM) diagnosis.\n    *   **Constraints:** Direct, accurate answers. No medical disclaimers. No"
+    },
+    {
+      "model": "qwen35+PQ",
+      "label": "Document synthesis \u2014 HPE",
+      "tps": 68.4,
+      "elapsed": 2.9,
+      "response": "<think>Thinking Process:\n\n1.  **Analyze the Request:**\n    *   **User:** Board-certified family medicine physician who builds software systems.\n    *   **Task:** Identify the single most defensible MHPE (Medical Humanistic/Professional/Health Professions Education) thesis direction from the provided document excerpt and identify the single critical success/failure factor.\n    *   **Constraints:** Direct, accurate answers. No medical disclaimers. No suggesting consulting a doctor. No hedging. Concise. Prefer bullet points.\n    *   **Source Material:** A project summary for \"Dr. Shapiro (HPE)\" containing details about a fetal presentation ultrasound simulator, a self-hosted AI assistant (MedGemma), and an encrypted XGBoost inference project.\n\n2.  **Analyze the Document Excerpt:**\n    *   **Project 1: Fetal Presentation Ultrasound Simulator.**\n        *   Goal: POCUS training for military (deploy"
+    },
+    {
+      "model": "qwen35+PQ",
+      "label": "Cross-document connection",
+      "tps": 59.2,
+      "elapsed": 3.4,
+      "response": "<think>Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Input: Two document excerpts (DOC 1: Architecture Evolution, DOC 2: Schema Evolution).\n    *   Task: Identify the single deepest architectural lesson from the Airtable+n8n era (one sentence). Then, determine if the current Postgres/FastAPI stack fully resolves it or if a version remains.\n    *   Constraints: Direct, accurate answers. No medical disclaimers. No hedging. Concise. Prefer bullet points.\n\n2.  **Analyze DOC 1 (Architecture Evolution):**\n    *   Timeline: Jun 2025 to Apr 2026.\n    *   Evolution: Monolith -> \"THIS IS THE ONE\" -> HTTP Nodes v7.0 -> Clean 9-phase -> Orchestrator.\n    *   Core Issue: \"Airtable record IDs are unstable across sessions.\"\n    *   Consequence:"
+    },
+    {
+      "model": "qwen35+PQ",
+      "label": "Self-assessment reflection",
+      "tps": 60.7,
+      "elapsed": 2.5,
+      "response": "<think>Thinking Process:\n\n1.  **Analyze the Request:**\n    *   Source Material: A provided text snippet titled \"Project Summary \u2014 Dr. Shapiro (HPE)\".\n    *   Task: Identify the structural difference between the finished projects (AAPM, weather model) and the unfinished ones (fetal presentation ultrasound simulator, self-hosted AI assistant, encrypted XGBoost inference) that explains why the former got finished.\n    *   Constraint: Direct, accurate answers. No medical disclaimers. No hedging. Concise. Prefer bullet points.\n\n2.  **Analyze the Source Text:**\n    *   Project 1: Fetal presentation ultrasound simulator (HPE fit). Status: \"No hardware"
+    }
+  ],
+  "mini_url": "http://127.0.0.1:18080",
+  "qwen_model_id": "mlx-community/Qwen3.5-35B-A3B-4bit"
+}
