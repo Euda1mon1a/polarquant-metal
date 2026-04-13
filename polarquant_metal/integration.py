@@ -57,20 +57,26 @@ def patch_sdpa():
     """
     global _original_lm_sdpa, _original_vlm_sdpa, _patched_lm_sdpa, _patched_vlm_sdpa
     import mlx_lm.models.base as lm_base_module
-    import mlx_vlm.models.base as vlm_base_module
+    try:
+        import mlx_vlm.models.base as vlm_base_module
+        _has_vlm = True
+    except ImportError:
+        vlm_base_module = None
+        _has_vlm = False
 
-    if _original_lm_sdpa is not None and _original_vlm_sdpa is not None:
+    if _original_lm_sdpa is not None:
         return  # Already patched
 
     _original_lm_sdpa = lm_base_module.scaled_dot_product_attention
-    _original_vlm_sdpa = vlm_base_module.scaled_dot_product_attention
     patched_lm_sdpa = _make_patched_sdpa(_original_lm_sdpa)
-    patched_vlm_sdpa = _make_patched_sdpa(_original_vlm_sdpa)
     _patched_lm_sdpa = patched_lm_sdpa
-    _patched_vlm_sdpa = patched_vlm_sdpa
-
     lm_base_module.scaled_dot_product_attention = patched_lm_sdpa
-    vlm_base_module.scaled_dot_product_attention = patched_vlm_sdpa
+
+    if _has_vlm:
+        _original_vlm_sdpa = vlm_base_module.scaled_dot_product_attention
+        patched_vlm_sdpa = _make_patched_sdpa(_original_vlm_sdpa)
+        _patched_vlm_sdpa = patched_vlm_sdpa
+        vlm_base_module.scaled_dot_product_attention = patched_vlm_sdpa
 
     # Also patch any already-imported model modules that copied the reference
     # Scan both mlx_lm and mlx_vlm modules; Gemma4 imports from mlx_vlm.models.base.
