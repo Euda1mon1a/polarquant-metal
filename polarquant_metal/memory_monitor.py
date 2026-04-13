@@ -53,7 +53,8 @@ def is_compatible_model(model_id: str) -> bool:
 def get_memory_pressure() -> str:
     """Return 'normal', 'warn', or 'critical'.
 
-    vm.memory_pressure sysctl values: 4=normal, 2=warn, 1=critical.
+    vm.memory_pressure sysctl values on macOS 26+: 0=normal, 1=warn, 4=critical.
+    Pre-26 sources documented 4=normal, 2=warn, 1=critical — kept for compatibility.
     Falls back to 'normal' on any error so inference is never blocked.
     """
     try:
@@ -64,7 +65,8 @@ def get_memory_pressure() -> str:
             timeout=1.0,
         )
         level = int(result.stdout.strip())
-        return {4: "normal", 2: "warn", 1: "critical"}.get(level, "warn")
+        # 0 and 4 both treated as normal (0 observed on macOS 26, 4 from legacy docs).
+        return {0: "normal", 4: "normal", 2: "warn", 1: "critical"}.get(level, "warn")
     except Exception:
         return "normal"
 
