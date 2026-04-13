@@ -10,9 +10,16 @@ from .kernels import (
     polarquant_sv_matmul,
 )
 from .cache import FusedPolarQuantKVCache
+from .tree_search import MCTSTree, MCTSNode, fork_layer_caches, draft_logprob_evaluator
+from .prm import ProcessRewardModel
 
 __all__ = [
     "polarquant_qk_matmul",
     "polarquant_sv_matmul",
     "FusedPolarQuantKVCache",
+    "MCTSTree",
+    "MCTSNode",
+    "fork_layer_caches",
+    "draft_logprob_evaluator",
+    "ProcessRewardModel",
 ]

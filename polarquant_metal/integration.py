@@ -10,31 +10,19 @@ Usage:
     # Now model(input_ids, cache=cache) uses fused Metal kernels automatically
 """
 
+import os
 import sys
 
 from .turboquant_cache import TurboQuantKVCache
 
-_original_sdpa = None
+_original_lm_sdpa = None
+_original_vlm_sdpa = None
+_patched_lm_sdpa = None
+_patched_vlm_sdpa = None
 
 
-def patch_sdpa():
-    """Patch mlx-lm's scaled_dot_product_attention to support TurboQuantKVCache.
-
-    Adds a dispatch check: if cache has `turbo_bits` attribute (set by
-    TurboQuantKVCache), routes to `cache.fused_sdpa()` which computes
-    attention directly from packed quantized data.
-
-    Same pattern as mlx-lm's existing `hasattr(cache, "bits")` check for
-    QuantizedKVCache — attribute-based dispatch, no model code changes.
-    """
-    global _original_sdpa
-    import mlx_lm.models.base as base_module
-
-    if _original_sdpa is not None:
-        return  # Already patched
-
-    _original_sdpa = base_module.scaled_dot_product_attention
-
+def _make_patched_sdpa(original_sdpa):
+    """Wrap an SDPA function with PolarQuant cache dispatch."""
     def _patched_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
         # TurboQuant fused path conditions:
         # 1. Decode only (L_q == 1) — prefill kernel is too slow for L_q > 1
@@ -50,38 +38,74 @@ def patch_sdpa():
                 values = cache.values
 
         # Fall through to original (handles prefill, short context, standard)
-        return _original_sdpa(
+        return original_sdpa(
             queries, keys, values, cache, scale=scale, mask=mask, sinks=sinks,
         )
 
-    base_module.scaled_dot_product_attention = _patched_sdpa
+    return _patched_sdpa
+
+
+def patch_sdpa():
+    """Patch mlx-lm and mlx-vlm SDPA functions to support TurboQuantKVCache.
+
+    Adds a dispatch check: if cache has `turbo_bits` attribute (set by
+    TurboQuantKVCache), routes to `cache.fused_sdpa()` which computes
+    attention directly from packed quantized data.
+
+    Same pattern as mlx-lm's existing `hasattr(cache, "bits")` check for
+    QuantizedKVCache — attribute-based dispatch, no model code changes.
+    """
+    global _original_lm_sdpa, _original_vlm_sdpa, _patched_lm_sdpa, _patched_vlm_sdpa
+    import mlx_lm.models.base as lm_base_module
+    import mlx_vlm.models.base as vlm_base_module
+
+    if _original_lm_sdpa is not None and _original_vlm_sdpa is not None:
+        return  # Already patched
+
+    _original_lm_sdpa = lm_base_module.scaled_dot_product_attention
+    _original_vlm_sdpa = vlm_base_module.scaled_dot_product_attention
+    patched_lm_sdpa = _make_patched_sdpa(_original_lm_sdpa)
+    patched_vlm_sdpa = _make_patched_sdpa(_original_vlm_sdpa)
+    _patched_lm_sdpa = patched_lm_sdpa
+    _patched_vlm_sdpa = patched_vlm_sdpa
+
+    lm_base_module.scaled_dot_product_attention = patched_lm_sdpa
+    vlm_base_module.scaled_dot_product_attention = patched_vlm_sdpa
 
     # Also patch any already-imported model modules that copied the reference
-    # Scan both mlx_lm and mlx_vlm modules (VLM models import SDPA from mlx_lm.models.base)
+    # Scan both mlx_lm and mlx_vlm modules; Gemma4 imports from mlx_vlm.models.base.
     for name, mod in list(sys.modules.items()):
         if (name.startswith("mlx_lm.models.") or name.startswith("mlx_vlm.models.")) and mod is not None:
             if hasattr(mod, "scaled_dot_product_attention"):
-                if mod.scaled_dot_product_attention is _original_sdpa:
-                    mod.scaled_dot_product_attention = _patched_sdpa
+                if mod.scaled_dot_product_attention is _original_lm_sdpa:
+                    mod.scaled_dot_product_attention = patched_lm_sdpa
+                elif mod.scaled_dot_product_attention is _original_vlm_sdpa:
+                    mod.scaled_dot_product_attention = patched_vlm_sdpa
 
 
 def unpatch_sdpa():
     """Restore original SDPA."""
-    global _original_sdpa
-    if _original_sdpa is None:
+    global _original_lm_sdpa, _original_vlm_sdpa, _patched_lm_sdpa, _patched_vlm_sdpa
+    if _original_lm_sdpa is None and _original_vlm_sdpa is None:
         return
 
-    import mlx_lm.models.base as base_module
-    base_module.scaled_dot_product_attention = _original_sdpa
+    import mlx_lm.models.base as lm_base_module
+    import mlx_vlm.models.base as vlm_base_module
+    lm_base_module.scaled_dot_product_attention = _original_lm_sdpa
+    vlm_base_module.scaled_dot_product_attention = _original_vlm_sdpa
 
     for name, mod in list(sys.modules.items()):
         if (name.startswith("mlx_lm.models.") or name.startswith("mlx_vlm.models.")) and mod is not None:
             if hasattr(mod, "scaled_dot_product_attention"):
-                # Only restore if it's our patched version
-                if mod.scaled_dot_product_attention is not _original_sdpa:
-                    mod.scaled_dot_product_attention = _original_sdpa
+                if _patched_lm_sdpa is not None and mod.scaled_dot_product_attention is _patched_lm_sdpa:
+                    mod.scaled_dot_product_attention = _original_lm_sdpa
+                elif _patched_vlm_sdpa is not None and mod.scaled_dot_product_attention is _patched_vlm_sdpa:
+                    mod.scaled_dot_product_attention = _original_vlm_sdpa
 
-    _original_sdpa = None
+    _original_lm_sdpa = None
+    _original_vlm_sdpa = None
+    _patched_lm_sdpa = None
+    _patched_vlm_sdpa = None
 
 
 def adaptive_threshold(default: int = 512, context_file: str = None) -> int:

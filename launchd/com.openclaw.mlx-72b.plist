@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openclaw.mlx-72b</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/aaronmontgomery/.pyenv/versions/3.12.12/bin/python3</string>
+        <string>/Users/aaronmontgomery/workspace/polarquant-metal/scripts/serve_72b.py</string>
+        <string>--port</string>
+        <string>8082</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--bits</string>
+        <string>3</string>
+        <string>--num-draft-tokens</string>
+        <string>4</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/aaronmontgomery</string>
+        <key>PATH</key>
+        <string>/Users/aaronmontgomery/.pyenv/versions/3.12.12/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/aaronmontgomery/workspace/polarquant-metal</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/aaronmontgomery/Library/Logs/com.openclaw.mlx-72b.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/aaronmontgomery/Library/Logs/com.openclaw.mlx-72b.err</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Delay startup to allow FileVault + network -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+</dict>
+</plist>

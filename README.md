@@ -1,5 +1,7 @@
 # PolarQuant Metal: Fused Metal Kernels for PolarQuant KV Cache
 
+[![HuggingFace Space](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Space-blue)](https://huggingface.co/spaces/3ud41mon14/polarquant-metal)
+
 Custom Metal kernels that eliminate the dequantize-on-fetch bottleneck in PolarQuant (TurboQuant) KV cache implementations on Apple Silicon.
 
 ## The Problem
@@ -33,7 +35,7 @@ No inverse rotation of keys needed. The codebook has only 2^bits entries (8 for 
 ## Install
 
 ```bash
-git clone <this-repo>
+git clone http://100.69.127.98:3030/aaron/polarquant-metal.git
 cd polarquant-metal
 python3 -m venv .venv
 ./.venv/bin/pip install -e '.[dev]'
@@ -227,6 +229,12 @@ PolarQuant is deployed on the OpenClaw MLX server (Qwen3.5-35B-A3B-4bit on port 
 
 None. Koa's text-router sends standard OpenAI-compatible requests. PolarQuant is entirely server-side.
 
+## Repository & Research
+
+**Source**: Private Gitea at `http://192.168.4.202:3030/aaron/polarquant-metal` (LAN) or `http://100.69.127.98:3030/aaron/polarquant-metal` (Tailscale). Branch `master`.
+
+**Research references**: Background papers, MLX issue threads, and prior art documents are stored in DEVONthink under the `Research_Capture` database, tagged `polarquant`. The `docs/` directory in this repo contains synthesized notes derived from that material.
+
 ## Limitations
 
 1. **Prefill is slow** — the per-element kernel can't parallelize across L_q > 1. Prefill falls back to standard FP16 SDPA automatically. Fused kernels only benefit decode (L_q=1).
@@ -241,9 +249,9 @@ None. Koa's text-router sends standard OpenAI-compatible requests. PolarQuant is
 
 Documented here for completeness. See `benchmarks/EXPERIMENTS.md` for full data.
 
-1. **Stroboscopic FP16 drift detection** — Hypothesis: quantization error accumulates over long contexts. Result: **No drift.** Cosine similarity stays >0.998 across 16K tokens. Re-quantizing from FP16 ground truth produces byte-identical output. Law of large numbers: softmax averaging dilutes per-token errors as context grows. Conclusion: no recalibration mechanism needed.
+1. **Stroboscopic FP16 drift detection** — Hypothesis: quantization error accumulates over long contexts. Result: **No drift.** Cosine similarity stays >0.998 across 16K tokens. Re-quantizing from FP16 ground truth produces byte-identical output. Law of large numbers: softmax averaging dilutes per-token errors as context grows. Consistent with TurboQuant's [0.997 NIAH score at 104K context](https://arxiv.org/abs/2504.19874) and [flovflo/turboquant-mlx](https://huggingface.co/flovflo/turboquant-mlx-qwen35-kv) reporting 100% exact match across 8.5K-64K tokens. Conclusion: no recalibration mechanism needed.
 
-2. **Spectral bit-width selection** — Hypothesis: heads with periodic attention patterns tolerate 2-bit quantization. Result: **No pattern survived 2-bit.** PolarQuant's random orthogonal rotation decorrelates signals before quantization, making error pattern-independent. The best 2-bit cosine similarity was 0.946 (periodic-64), below the 0.95 safety threshold. Uniform 3-bit is the correct default.
+2. **Spectral bit-width selection** — Hypothesis: heads with periodic attention patterns tolerate 2-bit quantization. Result: **No pattern survived 2-bit.** PolarQuant's random orthogonal rotation decorrelates signals before quantization, making error pattern-independent (same mechanism as [QuaRot](https://arxiv.org/abs/2404.00456), NeurIPS 2024). The best 2-bit cosine similarity was 0.946 (periodic-64), below the 0.95 safety threshold. Uniform 3-bit is the correct default.
 
 3. **Adaptive codebook learning (stigmergy)** — Hypothesis: online codebook adaptation via usage-frequency reinforcement. Result: **Not novel.** This is standard online k-means / EMA codebook updates (VQ-VAE, 1967). Additionally, PolarQuant's rotation makes distributions approximately Gaussian, for which Lloyd-Max is already optimal. Would not improve quality.
 
@@ -251,7 +259,21 @@ Documented here for completeness. See `benchmarks/EXPERIMENTS.md` for full data.
 
 ## Prior Art & Novel Contributions
 
-Novelty assessment via Perplexity deep research (2026-03-31).
+Novelty assessment grounded in [Perplexity deep research](https://huggingface.co/spaces/3ud41mon14/polarquant-metal) (2026-03-31). Claims ordered by strength.
+
+### Primary Contributions (no prior art found)
+
+1. **Entropy-guided per-head adaptive Sparse V** -- Shannon entropy of post-softmax attention weights gates per-head pruning threshold at runtime. Concentrated heads pruned aggressively, spread heads protected. No prior work applies entropy-gated thresholds to sparse attention on any platform. Related: [HIES](https://arxiv.org/abs/2410.10165) (NeurIPS 2025 workshop) uses entropy for offline head pruning; [arXiv 2501.03489](https://arxiv.org/abs/2501.03489) uses entropy for training-time regularization -- neither for runtime decode-time skip gating.
+2. **Rigidity-gated quantization skip** -- cosine similarity of consecutive rotated unit vectors detects redundant KV entries; skips quantize+pack when codebook indices would be identical. 78% skip rate on smooth text, 0% on topic changes. No direct prior art. Related: [CosineGate](https://arxiv.org/abs/2411.09967) (NeurIPS 2025) uses cosine incompatibility to skip ResNet blocks; Token Filtering (Dec 2025) uses KV cosine for layer-level skip -- neither operates on per-token quantization.
+3. **Asymmetric K/V bit-widths in MLX** -- different quantization bits for keys vs values. First MLX-native implementation. Concept from [KIVI](https://arxiv.org/abs/2402.02750) (ICML 2024) and [KVSplit](https://github.com/dipampaul17/KVSplit) (llama.cpp, May 2025). [mlx-lm issue #191](https://github.com/ml-explore/mlx-lm/issues/191) discussed but never merged.
+
+### Incremental / Concurrent Contributions
+
+4. **Fused bidirectional Metal kernels** (QK + SV) -- both Q@K^T and scores@V computed directly from packed codebook indices. QK side independently implemented by oMLX v0.2.21 and mlx-lm PR #1067. SV side is the natural extension; oMLX's fused 2-pass kernel may already cover it.
+5. **Sparse V on Apple Silicon** -- threshold-based skipping of near-zero attention positions in Metal SV kernel. [SpargeAttn](https://github.com/thu-ml/SpargeAttn) (ICML 2025) on CUDA. [TheTom/turboquant_plus](https://github.com/TheTom/turboquant_plus) independently proposed attention-gated value dequantization on Metal (March 24, 2026) -- simultaneous independent work.
+6. **Combined pipeline** -- fused attention + entropy-guided Sparse V + rigidity gate + asymmetric K/V + lazy threshold on M4 Pro. Novel as an integrated system; individual components have varying novelty.
+
+**Result:** 75.3 tok/s vs 71.4 tok/s standard (5% faster than FP16 with 8x KV cache compression). Phase 2 adds per-head adaptive gains on top.
 
 ### Prior Art (not novel to this project)
 
@@ -276,11 +298,20 @@ Novelty assessment via Perplexity deep research (2026-03-31).
 
 ### Key References
 
-- SpargeAttn (ICML 2025) -- sparse warp online softmax, CUDA only
-- KIVI (ICML 2024) -- per-channel K / per-token V quantization, CUDA only
-- PackKV (Dec 2025) -- extends KIVI
-- oMLX v0.2.21 (March 2026) -- fused 2-pass Flash Attention, codebook, Metal
-- mlx-lm PR #1067 (arozanov, March 28 2026) -- fused Metal quantize/dequantize kernels
+- [TurboQuant (arXiv:2504.19874)](https://arxiv.org/abs/2504.19874) -- Zandieh et al., ICLR 2026
+- [SpargeAttn](https://github.com/thu-ml/SpargeAttn) -- ICML 2025, sparse warp online softmax (CUDA)
+- [KIVI](https://arxiv.org/abs/2402.02750) -- ICML 2024, per-channel K / per-token V quantization (CUDA)
+- [PackKV](https://arxiv.org/abs/2412.03631) -- Dec 2025, extends KIVI
+- [AsymKV](https://aclanthology.org/2025.coling-main.576/) -- COLING 2025, 1-bit V with higher-bit K
+- [KVSplit](https://github.com/dipampaul17/KVSplit) -- May 2025, K8V4 for llama.cpp on Apple Silicon
+- [QuaRot](https://arxiv.org/abs/2404.00456) -- NeurIPS 2024, rotation-based outlier elimination
+- [oMLX v0.2.21](https://github.com/jundot/omlx) -- March 2026, fused 2-pass Flash Attention (Metal)
+- [mlx-lm PR #1067](https://github.com/ml-explore/mlx-lm/pull/1067) -- March 2026, fused Metal quantize/dequantize
+- [mlx-lm Issue #191](https://github.com/ml-explore/mlx-lm/issues/191) -- Asymmetric K/V discussion
+- [TheTom/turboquant_plus](https://github.com/TheTom/turboquant_plus) -- March 2026, sparse-V on Metal (concurrent)
+- [CosineGate](https://arxiv.org/abs/2411.09967) -- NeurIPS 2025, cosine-gated residual block skipping
+- [HIES](https://arxiv.org/abs/2410.10165) -- NeurIPS 2025 workshop, entropy-based head importance
+- [Entropy-Guided Attention (arXiv:2501.03489)](https://arxiv.org/abs/2501.03489) -- Jan 2025, headwise entropy regularization
 
 ## License
 
@@ -289,6 +320,9 @@ MIT
 ## References
 
 - [TurboQuant (arXiv:2504.19874)](https://arxiv.org/abs/2504.19874) — Zandieh et al., ICLR 2026
+- [flovflo/turboquant-mlx-qwen35-kv](https://huggingface.co/flovflo/turboquant-mlx-qwen35-kv) — MLX TurboQuant test data (100% recall at 64K)
 - [rachittshah/mlx-turboquant](https://github.com/rachittshah/mlx-turboquant) — Paper-faithful MLX implementation
 - [ml-explore/mlx-lm Issue #1060](https://github.com/ml-explore/mlx-lm/issues/1060) — Upstream tracking
 - [MLX Custom Metal Kernels](https://ml-explore.github.io/mlx/build/html/dev/custom_metal_kernels.html) — MLX kernel API docs
+- [QuaRot (arXiv:2404.00456)](https://arxiv.org/abs/2404.00456) — NeurIPS 2024, rotation-based outlier elimination
+- [Interactive benchmarks & novelty assessment](https://huggingface.co/spaces/3ud41mon14/polarquant-metal) — HuggingFace Space
