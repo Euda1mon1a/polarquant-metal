@@ -58,6 +58,26 @@ Fused 4-bit output:
 
 Both correct. Different wording expected from quantization affecting attention.
 
+### Llama-3.2-3B — NOT BENEFICIAL (small model)
+
+Long-context sweep (2K-16K, 64 decode tokens, 3-bit, M4 Pro 64GB):
+
+| Context | FP16 tok/s | PQ3 tok/s | PQ3/FP16 | Note |
+|---------|-----------|----------|---------|------|
+| 2,048 | 104.9 | 24.3 | 0.23x | |
+| 4,096 | 94.8 | 22.2 | 0.23x | |
+| 8,192 | 92.6 | 22.8 | 0.25x | seed capped at 4503 tokens |
+| 16,384 | 92.5 | 23.9 | 0.26x | seed capped at 4503 tokens |
+
+**Conclusion:** PolarQuant is ~4x slower than FP16 for Llama-3.2-3B at all context lengths.
+The overhead is constant (not context-dependent) — the bottleneck is Metal kernel dispatch +
+codebook lookup, not memory bandwidth. For a 3B model, the entire KV cache fits in fast
+GPU memory and standard SDPA is already bandwidth-optimal. PolarQuant adds overhead without
+reducing any real bottleneck.
+
+**Rule:** PolarQuant is beneficial when the model is large enough that KV cache memory
+bandwidth IS the bottleneck (35B+). For models ≤ 7B on a 64 GB system, use standard FP16.
+
 ### Phi-4-Mini-Instruct-4bit — DEGRADES
 
 4-bit output degrades to repetition loops ("sentences sentences sentences...").
@@ -142,7 +162,7 @@ After SV kernel optimization (pre-combined weight*norm):
 ## What to Optimize Next
 
 1. **SV kernel further optimization** — still 47% of time at 2K. Potential: simdgroup-level reduction (simd_sum), data layout transposition for coalesced index reads
-2. **Short context speed** — at L_kv=64, kernel dispatch overhead dominates (74% lazy eval savings)
+2. **Short context speed** — at L_kv=64, kernel dispatch overhead dominates (74% lazy eval savings). Note: `min_fused_context=512` already prevents fused path below 512 tokens; overhead exists in isolated kernel bench only
 3. **Prefill kernel** — currently 0.17x at L_q=256. Needs simdgroup reduction and query tiling
-4. **Model compatibility** — test more architectures to map which work with PolarQuant
-5. **Longer contexts (4K-8K)** — fused advantage grows with context. Benchmark to quantify
+4. **~~Model compatibility~~** — ✓ Done (2026-04-13): Llama-3.2-3B is NOT beneficial (see above). PolarQuant sweet spot is 35B+ where KV memory bandwidth is the bottleneck
+5. **~~Longer contexts (4K-8K)~~** — ✓ Done (2026-04-13): see Llama-3B sweep above. Full-fidelity test needs 35B+ model
