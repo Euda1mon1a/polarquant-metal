@@ -6,3 +6,9 @@ dist/
 build/
 .eggs/
 benchmarks/GEMMA4_BENCH_*.json
+
+# Zig build artifacts
+.zig-cache/
+zig-out/
+kernels/*.air
+kernels/*.metallib
