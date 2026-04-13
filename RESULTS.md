@@ -159,10 +159,37 @@ After SV kernel optimization (pre-combined weight*norm):
 - oMLX v0.2.21 (March 2026) — fused 2-pass Flash Attention, codebook, Metal
 - mlx-lm PR #1067 (arozanov, March 28 2026) — fused Metal quantize/dequantize kernels
 
+## Simdgroup Reduction (2026-04-13)
+
+Added `_SV_SIMD_SOURCE` and `_SV_SIMD_SPARSE_SOURCE` — simdgroup-reduced variants
+of the precombined-dense and compact-index-sparse SV kernels respectively.
+
+**Approach:** 32 threads (one simdgroup) cooperate on each output element `(b, h, q, d)`.
+- Dense path: lanes stride over `L_kv` in steps of 32 (`k = lane, lane+32, ...`)
+- Sparse path: lanes stride over `count` active positions in steps of 32
+- `simd_sum(partial)` collapses partial sums in a single hardware instruction
+- Lane 0 writes the result
+
+**Grid change:** `(B * n_heads * L_q * D * 32, 1, 1)`, threadgroup `(32, 1, 1)`.
+
+**Wins:**
+- Dense: 32x less inner-loop work per thread; better occupancy; effective at all L_kv
+- Sparse: parallelizes the count loop — most impactful at L_kv ≥ 8K (count ≥ 80)
+- Prefill (L_q > 1) is now also accelerated via the dense simd path
+
+**Benchmark:** run `python benchmarks/bench_sv_simd.py` on Mini with 35B loaded
+(needs 35B for memory-bandwidth-bound regime where effect is largest).
+
+**Validation:** `kernels/polarquant_sv_simd.metal` added; all 4 kernels compile
+clean via `xcrun metal` on macOS 26.4.
+
 ## What to Optimize Next
 
-1. **SV kernel further optimization** — still 47% of time at 2K. Potential: simdgroup-level reduction (simd_sum), data layout transposition for coalesced index reads
+1. **~~SV simdgroup reduction~~** — ✓ Done (2026-04-13). Both dense and sparse paths
+   now use `_SV_SIMD_SOURCE` / `_SV_SIMD_SPARSE_SOURCE`. Benchmark on 35B to quantify.
 2. **Short context speed** — at L_kv=64, kernel dispatch overhead dominates (74% lazy eval savings). Note: `min_fused_context=512` already prevents fused path below 512 tokens; overhead exists in isolated kernel bench only
-3. **Prefill kernel** — currently 0.17x at L_q=256. Needs simdgroup reduction and query tiling
+3. **Prefill query tiling** — simdgroup covers the L_kv reduction but not multi-query
+   tiling. For very large prefill (L_q ≥ 512), a threadgroup-tiled QK + SV kernel
+   would further help. Needs `threadgroup_memory_length` and barrier coordination.
 4. **~~Model compatibility~~** — ✓ Done (2026-04-13): Llama-3.2-3B is NOT beneficial (see above). PolarQuant sweet spot is 35B+ where KV memory bandwidth is the bottleneck
 5. **~~Longer contexts (4K-8K)~~** — ✓ Done (2026-04-13): see Llama-3B sweep above. Full-fidelity test needs 35B+ model

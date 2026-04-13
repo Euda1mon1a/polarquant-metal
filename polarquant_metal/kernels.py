@@ -311,6 +311,64 @@ _SV_PRECOMBINED_SOURCE = """
     out[elem] = T(acc);
 """
 
+# ---------------------------------------------------------------------------
+# Simdgroup-reduced dense SV kernel — handles L_q ≥ 1 (decode and prefill).
+# ---------------------------------------------------------------------------
+# Grid: (B * n_heads * L_q * D * 32, 1, 1), Threadgroup: (32, 1, 1)
+#
+# Each simdgroup of 32 threads computes one (b, h, q, d) output element.
+# Lanes split the L_kv loop: lane l handles k = l, l+32, l+64, ...
+# simd_sum reduces partial sums; lane 0 writes output.
+#
+# At L_q=256, L_kv=1024: each lane does 1024/32 = 32 iterations (vs 1024 scalar).
+# At L_kv=32768 decode: each lane does ~1024 iterations (vs 32768 scalar).
+
+_SV_SIMD_SOURCE = """
+    constexpr uint SIMD_SIZE = 32;
+    uint gid  = thread_position_in_grid.x;
+    uint lane = thread_position_in_threadgroup.x;  // 0..31
+    uint elem = gid / SIMD_SIZE;
+
+    uint actual_D   = actual_dim[0];
+    uint L_q        = wn_combined_shape[2];
+    uint L_kv       = wn_combined_shape[3];
+    uint n_heads    = wn_combined_shape[1];
+    uint n_kv_heads = v_indices_shape[1];
+
+    uint d_idx = elem % actual_D;
+    uint q_idx = (elem / actual_D) % L_q;
+    uint h_idx = (elem / actual_D / L_q) % n_heads;
+    uint b_idx = elem / (actual_D * L_q * n_heads);
+
+    uint kv_h_idx = h_idx / (n_heads / n_kv_heads);
+
+    constexpr uint vals_per_int = 32 / BITS;
+    uint D_packed = (actual_D + vals_per_int - 1) / vals_per_int;
+
+    uint wn_base = ((b_idx * n_heads + h_idx) * L_q + q_idx) * L_kv;
+    uint vi_base = ((b_idx * n_kv_heads + kv_h_idx) * L_kv) * D_packed;
+
+    float sv_thresh = sparse_thresh[h_idx];
+
+    // Each lane processes a stride-32 subset of L_kv
+    float partial = 0.0f;
+    for (uint k = lane; k < L_kv; k += SIMD_SIZE) {
+        float wn_val = float(wn_combined[wn_base + k]);
+        if (wn_val > sv_thresh || wn_val < -sv_thresh) {
+            uint idx = unpack_index<BITS>(&v_indices[vi_base + k * D_packed], d_idx);
+            partial += wn_val * float(v_centroids[idx]);
+        }
+    }
+
+    // Reduce across simdgroup — single hardware instruction on Apple Silicon
+    float acc = simd_sum(partial);
+
+    // Only lane 0 writes (avoids 32x redundant stores)
+    if (lane == 0) {
+        out[elem] = T(acc);
+    }
+"""
+
 
 def _build_sv_precombined_kernel(bits: int):
     """Build the optimized SV kernel with Sparse V threshold."""
@@ -321,6 +379,22 @@ def _build_sv_precombined_kernel(bits: int):
         output_names=["out"],
         header=_QK_KERNEL_HEADER,
         source=_SV_PRECOMBINED_SOURCE,
+    )
+
+
+def _build_sv_simd_kernel(bits: int):
+    """Build the simdgroup-reduced dense SV kernel (handles L_q ≥ 1).
+
+    32 lanes per output element parallelize the L_kv inner loop.
+    Grid: (B * n_heads * L_q * D * 32, 1, 1), Threadgroup: (32, 1, 1).
+    """
+    return mx.fast.metal_kernel(
+        name=f"polarquant_sv_simd_{bits}bit",
+        input_names=["wn_combined", "v_indices", "v_centroids", "actual_dim",
+                      "sparse_thresh"],
+        output_names=["out"],
+        header=_QK_KERNEL_HEADER,
+        source=_SV_SIMD_SOURCE,
     )
 
 
@@ -429,8 +503,84 @@ def _build_sv_sparse_kernel(bits: int):
     )
 
 
+# ---------------------------------------------------------------------------
+# Simdgroup-reduced compact-index sparse SV — Phase 3, decode (L_q=1).
+# ---------------------------------------------------------------------------
+# Grid: (B * n_heads * D * 32, 1, 1), Threadgroup: (32, 1, 1)
+#
+# Each simdgroup of 32 threads computes one (b, h, d) output element.
+# Lanes split the compact active-position loop 32-ways.
+# simd_sum reduces; lane 0 writes output.
+#
+# At 32K context, ~327 active positions (1%): each lane handles ~10 iterations.
+# At 8K context, ~82 active positions: each lane handles ~3 iterations.
+
+_SV_SIMD_SPARSE_SOURCE = """
+    constexpr uint SIMD_SIZE = 32;
+    uint gid  = thread_position_in_grid.x;
+    uint lane = thread_position_in_threadgroup.x;
+    uint elem = gid / SIMD_SIZE;
+
+    uint actual_D   = actual_dim[0];
+    uint L_kv       = max_L_kv[0];
+    uint n_heads    = wn_shape[1];
+    uint n_kv_heads = v_indices_shape[1];
+
+    uint d_idx = elem % actual_D;
+    uint h_idx = (elem / actual_D) % n_heads;
+    uint b_idx = elem / (actual_D * n_heads);
+
+    uint kv_h_idx = h_idx / (n_heads / n_kv_heads);
+
+    constexpr uint vals_per_int = 32 / BITS;
+    uint D_packed = (actual_D + vals_per_int - 1) / vals_per_int;
+
+    uint stride    = 1 + L_kv;
+    uint head_base = (b_idx * n_heads + h_idx) * stride;
+    uint count     = count_and_indices[head_base];
+
+    uint wn_base = (b_idx * n_heads + h_idx) * L_kv;
+    uint vi_base = (b_idx * n_kv_heads + kv_h_idx) * L_kv * D_packed;
+
+    // Each lane handles a stride-32 subset of active positions
+    float partial = 0.0f;
+    for (uint i = lane; i < count; i += SIMD_SIZE) {
+        uint k       = count_and_indices[head_base + 1 + i];
+        float wn_val = float(wn[wn_base + k]);
+        uint  idx    = unpack_index<BITS>(&v_indices[vi_base + k * D_packed], d_idx);
+        partial += wn_val * float(v_centroids[idx]);
+    }
+
+    // Reduce across simdgroup — single instruction on Apple Silicon
+    float acc = simd_sum(partial);
+
+    if (lane == 0) {
+        out[elem] = T(acc);
+    }
+"""
+
+
+def _build_sv_simd_sparse_kernel(bits: int):
+    """Build the simdgroup-reduced sparse SV kernel (Phase 3 compact-index path).
+
+    32 lanes per output element parallelize the active-position inner loop.
+    Grid: (B * n_heads * D * 32, 1, 1), Threadgroup: (32, 1, 1).
+    """
+    return mx.fast.metal_kernel(
+        name=f"polarquant_sv_simd_sparse_{bits}bit",
+        input_names=[
+            "count_and_indices", "wn", "v_indices", "v_centroids",
+            "actual_dim", "max_L_kv",
+        ],
+        output_names=["out"],
+        header=_QK_KERNEL_HEADER,
+        source=_SV_SIMD_SPARSE_SOURCE,
+    )
+
+
 _sv_index_kernel = None
 _sv_sparse_kernels = {}
+_sv_simd_sparse_kernels = {}
 
 
 def polarquant_sv_build_index(
@@ -480,6 +630,7 @@ def polarquant_sv_sparse(
     head_dim: int,
     L_kv: int,
     bits: int = 3,
+    use_simd: bool = True,
 ) -> mx.array:
     """Sparse SV matmul — iterates only active positions from compact index.
 
@@ -491,32 +642,48 @@ def polarquant_sv_sparse(
         head_dim: actual D
         L_kv: context length (for stride calculation)
         bits: quantization bits
+        use_simd: use simdgroup-reduced kernel (default True). 32 lanes per
+            output element parallelize the active-position inner loop.
+            Most beneficial at L_kv > 8K where active count >> 32.
 
     Returns:
         output: (B, n_heads, 1, D) attention output (L_q=1 for decode)
     """
-    if bits not in _sv_sparse_kernels:
-        _sv_sparse_kernels[bits] = _build_sv_sparse_kernel(bits)
-    kernel = _sv_sparse_kernels[bits]
-
     B, n_heads = wn_combined.shape[0], wn_combined.shape[1]
     out_shape = (B, n_heads, 1, head_dim)
-    total_elements = int(np.prod(out_shape))
-
     actual_dim_arr = mx.array([head_dim], dtype=mx.uint32)
     max_L_kv_arr = mx.array([L_kv], dtype=mx.uint32)
+    inputs = [count_and_indices, wn_combined, v_indices, v_centroids,
+              actual_dim_arr, max_L_kv_arr]
+    template = [("T", wn_combined.dtype), ("BITS", bits)]
 
-    outputs = kernel(
-        inputs=[
-            count_and_indices, wn_combined, v_indices, v_centroids,
-            actual_dim_arr, max_L_kv_arr,
-        ],
-        template=[("T", wn_combined.dtype), ("BITS", bits)],
-        output_shapes=[out_shape],
-        output_dtypes=[wn_combined.dtype],
-        grid=(total_elements, 1, 1),
-        threadgroup=(min(256, total_elements), 1, 1),
-    )
+    if use_simd:
+        if bits not in _sv_simd_sparse_kernels:
+            _sv_simd_sparse_kernels[bits] = _build_sv_simd_sparse_kernel(bits)
+        kernel = _sv_simd_sparse_kernels[bits]
+        SG = 32
+        total = B * n_heads * head_dim
+        outputs = kernel(
+            inputs=inputs,
+            template=template,
+            output_shapes=[out_shape],
+            output_dtypes=[wn_combined.dtype],
+            grid=(total * SG, 1, 1),
+            threadgroup=(SG, 1, 1),
+        )
+    else:
+        if bits not in _sv_sparse_kernels:
+            _sv_sparse_kernels[bits] = _build_sv_sparse_kernel(bits)
+        kernel = _sv_sparse_kernels[bits]
+        total = int(np.prod(out_shape))
+        outputs = kernel(
+            inputs=inputs,
+            template=template,
+            output_shapes=[out_shape],
+            output_dtypes=[wn_combined.dtype],
+            grid=(total, 1, 1),
+            threadgroup=(min(256, total), 1, 1),
+        )
     return outputs[0]
 
 
@@ -525,6 +692,7 @@ _qk_kernels = {}
 _qk_tiled_kernels = {}
 _sv_kernels = {}
 _sv_pre_kernels = {}
+_sv_simd_kernels = {}
 
 TILE_Q = 8
 TILE_K = 32
@@ -614,6 +782,7 @@ def polarquant_sv_matmul(
     bits: int = 3,
     precombine: bool = True,
     sparse_v_threshold=0.0,
+    use_simd: bool = True,
 ) -> mx.array:
     """Fused PolarQuant softmax(scores) @ V matmul.
 
@@ -630,6 +799,9 @@ def polarquant_sv_matmul(
         precombine: pre-multiply weight*norm on host (default True, ~25% faster)
         sparse_v_threshold: per-head threshold array (n_heads,) or scalar float.
             Kernel indexes by h_idx. 0.0 disables. Try 1e-4 to 1e-3 for speedup.
+        use_simd:   use simdgroup-reduced kernel for precombine path (default True).
+            32 lanes per output element parallelize the L_kv inner loop.
+            Effective at all context lengths; most impactful at L_kv ≥ 1K.
 
     Returns:
         output: (B, n_heads, L_q, D) attention output
@@ -660,18 +832,31 @@ def polarquant_sv_matmul(
             norms_exp = norms_sq
         wn = weights * norms_exp[:, :, None, :]
 
-        if bits not in _sv_pre_kernels:
-            _sv_pre_kernels[bits] = _build_sv_precombined_kernel(bits)
-        kernel = _sv_pre_kernels[bits]
-
-        outputs = kernel(
-            inputs=[wn, v_indices, v_centroids, actual_dim_arr, thresh_arr],
-            template=[("T", weights.dtype), ("BITS", bits)],
-            output_shapes=[out_shape],
-            output_dtypes=[weights.dtype],
-            grid=(total_elements, 1, 1),
-            threadgroup=(min(256, total_elements), 1, 1),
-        )
+        if use_simd:
+            if bits not in _sv_simd_kernels:
+                _sv_simd_kernels[bits] = _build_sv_simd_kernel(bits)
+            kernel = _sv_simd_kernels[bits]
+            SG = 32
+            outputs = kernel(
+                inputs=[wn, v_indices, v_centroids, actual_dim_arr, thresh_arr],
+                template=[("T", weights.dtype), ("BITS", bits)],
+                output_shapes=[out_shape],
+                output_dtypes=[weights.dtype],
+                grid=(total_elements * SG, 1, 1),
+                threadgroup=(SG, 1, 1),
+            )
+        else:
+            if bits not in _sv_pre_kernels:
+                _sv_pre_kernels[bits] = _build_sv_precombined_kernel(bits)
+            kernel = _sv_pre_kernels[bits]
+            outputs = kernel(
+                inputs=[wn, v_indices, v_centroids, actual_dim_arr, thresh_arr],
+                template=[("T", weights.dtype), ("BITS", bits)],
+                output_shapes=[out_shape],
+                output_dtypes=[weights.dtype],
+                grid=(total_elements, 1, 1),
+                threadgroup=(min(256, total_elements), 1, 1),
+            )
     else:
         if bits not in _sv_kernels:
             _sv_kernels[bits] = _build_sv_kernel(bits)
