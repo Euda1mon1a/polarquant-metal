@@ -117,6 +117,35 @@ class TurboQuantKVCache:
             self._key_centroids_f32 = load_codebook_f32(self.turbo_bits, head_dim)
             self._value_centroids_f32 = load_codebook_f32(self._bits_v, head_dim)
 
+    def memory_bytes(self) -> int:
+        """Return the memory footprint of stored KV data in bytes.
+
+        Counts only tokens actually written (up to offset), not
+        pre-allocated capacity (step=256 blocks).  Used by the server's
+        proactive tier escalation to trigger compression before the OS
+        reports memory pressure.
+        """
+        if self._head_dim is None or self.offset == 0:
+            return 0
+
+        if self._fp16_keys is not None:
+            # Lazy FP16 path: keys + values, float16 (2 bytes each)
+            B, n_kv_heads = self._fp16_keys.shape[:2]
+            return 2 * B * n_kv_heads * self.offset * self._head_dim * 2
+
+        if self._k_packed is not None:
+            # Quantized path: packed uint32 indices + float16 norms for K and V.
+            # _k_packed shape: (B, n_kv_heads, capacity, packed_words)
+            B, n_kv_heads = self._k_packed.shape[:2]
+            k_packed_words = self._k_packed.shape[-1]   # uint32s per token
+            v_packed_words = self._v_packed.shape[-1]
+            # packed: uint32 = 4 bytes, norm: float16 = 2 bytes (1 scalar per token)
+            k_bytes = B * n_kv_heads * self.offset * (k_packed_words * 4 + 2)
+            v_bytes = B * n_kv_heads * self.offset * (v_packed_words * 4 + 2)
+            return k_bytes + v_bytes
+
+        return 0
+
     def update_and_fetch(self, keys, values):
         """Store new KV entries. Uses FP16 until context reaches threshold,
         then bulk-quantizes and switches to PolarQuant compressed storage.

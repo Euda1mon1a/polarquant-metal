@@ -202,13 +202,54 @@ Key findings:
 **Validation:** `kernels/polarquant_sv_simd.metal` added; all 4 kernels compile
 clean via `xcrun metal` on macOS 26.4.
 
+## Proactive KV Cache Budget Escalation (2026-04-13)
+
+Added `TurboQuantKVCache.memory_bytes()` and KV-budget-aware proactive tier
+escalation to `AdaptiveTierController`.
+
+**Problem:** OS `vm.memory_pressure` is a lagging indicator — it signals after
+the kernel has already paged out. For 35B at 32K context, the KV cache can
+grow to 4–8 GB in seconds, faster than the OS pressure poll cycle.
+
+**Solution:** server registers a `reporter` lambda with the monitor at startup.
+Each poll cycle, the monitor combines OS pressure with a KV-budget pressure
+signal and takes the more severe:
+
+```
+combined = max(os_pressure, kv_pressure)  # severity ordering: normal < warn < critical
+```
+
+KV budget thresholds (constants in `memory_monitor.py`, tune on 35B):
+- ≥ 70% of budget → `warn` (4-bit K/V, sparse_v_threshold=1e-4)
+- ≥ 90% of budget → `critical` (3-bit K, 4-bit V, sparse_v_threshold=1e-3)
+
+`memory_bytes()` formula:
+- FP16 path: `2 × B × n_kv_heads × offset × D × 2` bytes
+- Quantized path: `(k_packed_words×4 + 2 + v_packed_words×4 + 2) × B × n_kv_heads × offset`
+- Verified: 3-bit, D=128 → 4.7x compression vs FP16 (matches kernel bench 4.6x)
+
+CLI usage:
+```
+python -m polarquant_metal.serving.server \
+    --model mlx-community/Qwen2.5-72B-Instruct-4bit \
+    --kv-cache-budget 4        # 4 GB: warn at 2.8 GB, critical at 3.6 GB
+```
+
+**`/memory_tier` endpoint** now exposes `kv_used_bytes`, `kv_budget_bytes`,
+`kv_used_pct` — useful for dashboarding and integration tests.
+
 ## What to Optimize Next
 
 1. **~~SV simdgroup reduction~~** — ✓ Done (2026-04-13). Both dense and sparse paths
    now use `_SV_SIMD_SOURCE` / `_SV_SIMD_SPARSE_SOURCE`. Benchmark on 35B to quantify.
-2. **Short context speed** — at L_kv=64, kernel dispatch overhead dominates (74% lazy eval savings). Note: `min_fused_context=512` already prevents fused path below 512 tokens; overhead exists in isolated kernel bench only
-3. **Prefill query tiling** — simdgroup covers the L_kv reduction but not multi-query
+2. **~~Proactive KV budget escalation~~** — ✓ Done (2026-04-13). `memory_bytes()` +
+   `set_kv_budget()` + combined OS+KV pressure signal in monitor thread.
+3. **Tune tier thresholds on 35B** — Run 35B at 8K–32K on Mini. Tune
+   `_KV_BUDGET_WARN_FRAC`/`_KV_BUDGET_CRITICAL_FRAC` and `sparse_v_threshold`
+   values in `TIERS`. The 1e-4/1e-3 values are placeholders from 3B experiments.
+4. **Short context speed** — at L_kv=64, kernel dispatch overhead dominates (74% lazy eval savings). Note: `min_fused_context=512` already prevents fused path below 512 tokens; overhead exists in isolated kernel bench only
+5. **Prefill query tiling** — simdgroup covers the L_kv reduction but not multi-query
    tiling. For very large prefill (L_q ≥ 512), a threadgroup-tiled QK + SV kernel
    would further help. Needs `threadgroup_memory_length` and barrier coordination.
-4. **~~Model compatibility~~** — ✓ Done (2026-04-13): Llama-3.2-3B is NOT beneficial (see above). PolarQuant sweet spot is 35B+ where KV memory bandwidth is the bottleneck
-5. **~~Longer contexts (4K-8K)~~** — ✓ Done (2026-04-13): see Llama-3B sweep above. Full-fidelity test needs 35B+ model
+6. **~~Model compatibility~~** — ✓ Done (2026-04-13): Llama-3.2-3B is NOT beneficial (see above). PolarQuant sweet spot is 35B+ where KV memory bandwidth is the bottleneck
+7. **~~Longer contexts (4K-8K)~~** — ✓ Done (2026-04-13): see Llama-3B sweep above. Full-fidelity test needs 35B+ model

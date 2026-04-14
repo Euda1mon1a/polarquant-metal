@@ -20,6 +20,16 @@ import logging
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+# ---------------------------------------------------------------------------
+# KV budget thresholds
+# ---------------------------------------------------------------------------
+
+# When total KV cache exceeds these fractions of the configured budget,
+# escalate proactively — before the OS reports memory pressure.
+# Tune these after benchmarking with 35B on Mini.
+_KV_BUDGET_WARN_FRAC: float = 0.70    # 70% → warn tier
+_KV_BUDGET_CRITICAL_FRAC: float = 0.90  # 90% → critical tier
+
 logger = logging.getLogger(__name__)
 
 
@@ -94,6 +104,11 @@ class AdaptiveTierController:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._callbacks: list[Callable[[QuantTier], None]] = []
+        # KV cache budget for proactive tier escalation (optional).
+        # When set, the monitor thread combines OS pressure with KV-budget
+        # pressure and takes the more severe signal.
+        self._kv_budget_bytes: Optional[int] = None
+        self._kv_reporter: Optional[Callable[[], int]] = None
 
     def start(self) -> None:
         """Start the background polling thread. No-op if already running."""
@@ -121,9 +136,60 @@ class AdaptiveTierController:
         with self._lock:
             self._callbacks.append(fn)
 
+    def set_kv_budget(self, budget_bytes: int, reporter: Callable[[], int]) -> None:
+        """Configure proactive KV cache budget escalation.
+
+        When total KV cache exceeds the budget threshold, the monitor
+        proactively escalates the tier without waiting for the OS to report
+        memory pressure.  Only escalation (quality reduction) is driven by
+        the budget signal; tier recovery still requires OS pressure to drop.
+
+        Args:
+            budget_bytes: Maximum KV cache bytes before proactive escalation.
+            reporter: Callable returning current total KV bytes across all
+                      active caches.  Called on each poll cycle — must be
+                      fast and thread-safe (no heavy computation, no GIL hold).
+        """
+        with self._lock:
+            self._kv_budget_bytes = budget_bytes
+            self._kv_reporter = reporter
+        logger.info(
+            "[MemPressure] KV budget set: %.2f GB (warn@%d%%, critical@%d%%)",
+            budget_bytes / 1e9,
+            int(_KV_BUDGET_WARN_FRAC * 100),
+            int(_KV_BUDGET_CRITICAL_FRAC * 100),
+        )
+
+    def _kv_pressure(self) -> str:
+        """Return synthetic pressure tier based on KV cache budget usage."""
+        with self._lock:
+            reporter = self._kv_reporter
+            budget = self._kv_budget_bytes
+        if reporter is None or budget is None:
+            return "normal"
+        try:
+            total = reporter()
+            frac = total / budget
+            if frac >= _KV_BUDGET_CRITICAL_FRAC:
+                return "critical"
+            if frac >= _KV_BUDGET_WARN_FRAC:
+                return "warn"
+        except Exception:
+            pass
+        return "normal"
+
     def _run(self) -> None:
         while self._running:
-            self._maybe_update(get_memory_pressure())
+            os_pressure = get_memory_pressure()
+            kv_pressure = self._kv_pressure()
+            # Take the more severe of the two signals — proactive KV budget
+            # escalation never overrides a higher OS pressure, and vice versa.
+            combined = (
+                os_pressure
+                if TIER_SEVERITY[os_pressure] >= TIER_SEVERITY[kv_pressure]
+                else kv_pressure
+            )
+            self._maybe_update(combined)
             time.sleep(self._poll_interval)
 
     def _maybe_update(self, observed: str) -> None:

@@ -28,6 +28,7 @@ import argparse
 import asyncio
 import json
 import logging
+import threading
 import time
 import uuid
 from typing import AsyncGenerator, Optional
@@ -84,12 +85,18 @@ class ModelState:
         self._active_caches: list[TurboQuantKVCache] = []
         self._caches_lock = threading.Lock()
 
+    def _total_kv_bytes(self) -> int:
+        """Return total KV cache memory across all active requests (bytes)."""
+        with self._caches_lock:
+            return sum(c.memory_bytes() for c in self._active_caches)
+
     def load(
         self,
         model_id: str,
         draft_model_id: Optional[str] = None,
         boundary_layers: int = 2,
         num_draft_tokens: int = 4,
+        kv_cache_budget: Optional[int] = None,
     ) -> None:
         logger.info("Loading main model: %s", model_id)
         patch_sdpa()
@@ -122,6 +129,14 @@ class ModelState:
         # Start memory pressure monitor and register tier-change callback.
         ctrl = start_monitor()
         ctrl.register_callback(self._on_tier_change)
+
+        if kv_cache_budget is not None:
+            ctrl.set_kv_budget(kv_cache_budget, self._total_kv_bytes)
+            logger.info(
+                "KV cache budget: %.2f GB (proactive escalation enabled)",
+                kv_cache_budget / 1e9,
+            )
+
         logger.info("Models ready. Memory pressure monitor started.")
         self.ready = True
 
@@ -217,17 +232,24 @@ def create_app(state: Optional[ModelState] = None) -> FastAPI:
 
     @app.get("/memory_tier")
     def memory_tier():
-        tier = get_controller().tier
+        ctrl = get_controller()
+        tier = ctrl.tier
         with _state._caches_lock:
             active_count = len(_state._active_caches)
+        kv_used = _state._total_kv_bytes()
+        with ctrl._lock:
+            kv_budget = ctrl._kv_budget_bytes
         return {
-            "tier": get_controller().tier_name,
+            "tier": ctrl.tier_name,
             "bits_k": tier.bits,
             "bits_v": tier.bits_v,
             "sparse_v_threshold": tier.sparse_v_threshold,
             "min_fused_context": tier.min_fused_context,
             "active_caches": active_count,
             "pq_compatible": _state._pq_compatible,
+            "kv_used_bytes": kv_used,
+            "kv_budget_bytes": kv_budget,
+            "kv_used_pct": round(kv_used / kv_budget * 100, 1) if kv_budget else None,
         }
 
     @app.get("/v1/models")
@@ -440,6 +462,7 @@ def serve(
     host: str = "0.0.0.0",
     boundary_layers: int = 2,
     num_draft_tokens: int = 4,
+    kv_cache_budget: Optional[int] = None,
 ) -> None:
     """Load models and start the server. Blocking call."""
     import uvicorn
@@ -448,6 +471,7 @@ def serve(
         draft_model_id=draft_model_id,
         boundary_layers=boundary_layers,
         num_draft_tokens=num_draft_tokens,
+        kv_cache_budget=kv_cache_budget,
     )
     app = create_app()
     uvicorn.run(app, host=host, port=port, log_level="info")
@@ -468,7 +492,17 @@ if __name__ == "__main__":
                         help="Seconds of sustained improvement before tier upgrade")
     parser.add_argument("--poll-interval", type=float, default=2.0,
                         help="Memory pressure poll interval in seconds")
+    parser.add_argument("--kv-cache-budget", type=float, default=None,
+                        metavar="GB",
+                        help="KV cache budget in GB. When the combined KV cache "
+                             "across active requests exceeds 70%% of this budget, "
+                             "tier escalates to 'warn'; at 90%% it escalates to "
+                             "'critical'. Proactive escalation fires before the OS "
+                             "reports memory pressure. Recommended: 4 for 35B on "
+                             "Mini (64 GB), 2 for 35B on MBP (64 GB).")
     args = parser.parse_args()
+
+    kv_budget = int(args.kv_cache_budget * 1024 ** 3) if args.kv_cache_budget else None
 
     # Start monitor before model load so it's ready by the time serve() returns.
     start_monitor(hysteresis_s=args.hysteresis, poll_interval_s=args.poll_interval)
@@ -480,4 +514,5 @@ if __name__ == "__main__":
         host=args.host,
         boundary_layers=args.boundary_layers,
         num_draft_tokens=args.num_draft_tokens,
+        kv_cache_budget=kv_budget,
     )
