@@ -285,18 +285,66 @@ python -m polarquant_metal.serving.server \
 **`/memory_tier` endpoint** now exposes `kv_used_bytes`, `kv_budget_bytes`,
 `kv_used_pct` — useful for dashboarding and integration tests.
 
+## Long-Context Benchmark — PENDING (2026-04-13)
+
+`benchmarks/bench_35b_longctx.py` was started on Mini (M4 Pro 64GB) comparing
+FP16 vs PQ-orig (scalar, `use_simd=False`) vs PQ-simd at 32K/64K/128K context.
+Results to be filled in when Mini is accessible.
+
+| ctx | FP16 | PQ-orig | PQ-simd | orig/fp16 | simd/fp16 | kv_mb | cmpr |
+|-----|------|---------|---------|-----------|-----------|-------|------|
+| 32K | — | — | — | — | — | — | — |
+| 64K | — | — | — | — | — | — | — |
+| 128K | — | — | — | — | — | — | — |
+
+Expected behavior based on breakeven analysis:
+- At 128K context, Qwen3.5-35B-A3B KV cache ≈ 1.68 GB (only 10/40 std attn layers)
+- Weight bandwidth ≈ 5 GB for 4-bit 35B → KV is ~25% of bottleneck at 128K
+- Expected modest gain (~1.2x) at 128K, near-FP16 at 32K/64K
+- The March 31 result (75.3 vs 71.4 tok/s) was likely at ~128K context
+
+For dense 35B (Gemma 4 31B), 32K context → KV cache ≈ 4–8 GB → dominant bottleneck.
+Expected 2–3x speedup at 32K on a dense model.
+
+## Serving Layer Split (2026-04-13)
+
+`polarquant_metal/serving/` and `polarquant_metal/memory_monitor.py` have been
+extracted into a standalone installable package: **`polarquant-serving`**.
+
+Local at `/tmp/polarquant-serving` (Gitea push pending):
+
+```
+polarquant-serving/
+  polarquant_serving/
+    __init__.py
+    memory_monitor.py   ← AdaptiveTierController, QuantTier, TIERS
+    server.py           ← FastAPI OpenAI-compatible server
+  pyproject.toml        ← deps: polarquant-metal>=0.1.0, fastapi, uvicorn
+  README.md
+```
+
+Imports updated: all `from ..X import` → `from polarquant_metal.X import` /
+`from polarquant_serving.X import`. Console script: `polarquant-serve`.
+
+The serving/* and memory_monitor.py files in polarquant-metal retain deprecation
+notices pointing to the new package for backward compatibility with the Mini LaunchAgent.
+
 ## What to Optimize Next
 
 1. **~~SV simdgroup reduction~~** — ✓ Done (2026-04-13). Both dense and sparse paths
    now use `_SV_SIMD_SOURCE` / `_SV_SIMD_SPARSE_SOURCE`. Benchmark on 35B to quantify.
 2. **~~Proactive KV budget escalation~~** — ✓ Done (2026-04-13). `memory_bytes()` +
    `set_kv_budget()` + combined OS+KV pressure signal in monitor thread.
-3. **Tune tier thresholds on 35B** — Run 35B at 8K–32K on Mini. Tune
+3. **~~Serving split~~** — ✓ Done (2026-04-13). `polarquant-serving` package created.
+   Push to Gitea + publish when ready.
+4. **Long-context 35B benchmark** — fill in the table above once Mini is accessible.
+5. **Tune tier thresholds on 35B** — Run 35B at 8K–32K on Mini. Tune
    `_KV_BUDGET_WARN_FRAC`/`_KV_BUDGET_CRITICAL_FRAC` and `sparse_v_threshold`
    values in `TIERS`. The 1e-4/1e-3 values are placeholders from 3B experiments.
-4. **Short context speed** — at L_kv=64, kernel dispatch overhead dominates (74% lazy eval savings). Note: `min_fused_context=512` already prevents fused path below 512 tokens; overhead exists in isolated kernel bench only
-5. **Prefill query tiling** — simdgroup covers the L_kv reduction but not multi-query
+6. **Short context speed** — at L_kv=64, kernel dispatch overhead dominates (74% lazy eval savings). Note: `min_fused_context=512` already prevents fused path below 512 tokens; overhead exists in isolated kernel bench only
+7. **Prefill query tiling** — simdgroup covers the L_kv reduction but not multi-query
    tiling. For very large prefill (L_q ≥ 512), a threadgroup-tiled QK + SV kernel
    would further help. Needs `threadgroup_memory_length` and barrier coordination.
-6. **~~Model compatibility~~** — ✓ Done (2026-04-13): Llama-3.2-3B is NOT beneficial (see above). PolarQuant sweet spot is 35B+ where KV memory bandwidth is the bottleneck
-7. **~~Longer contexts (4K-8K)~~** — ✓ Done (2026-04-13): see Llama-3B sweep above. Full-fidelity test needs 35B+ model
+8. **~~Model compatibility~~** — ✓ Done (2026-04-13): Llama-3.2-3B is NOT beneficial (see above). PolarQuant sweet spot is 35B+ where KV memory bandwidth is the bottleneck
+9. **Gemma 4 31B benchmark** — dense model, true primary target. After serving split
+   is deployed on Mini, benchmark at 32K/64K context.
