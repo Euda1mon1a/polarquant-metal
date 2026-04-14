@@ -39,7 +39,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from ..integration import make_fused_cache, patch_sdpa
-from ..memory_monitor import start_monitor, get_controller, is_compatible_model
+from ..memory_monitor import start_monitor, get_controller, is_compatible_model, QuantTier
+from ..turboquant_cache import TurboQuantKVCache
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,10 @@ class ModelState:
         self.num_draft_tokens: int = 4
         self.ready: bool = False
         self._pq_compatible: bool = True  # False for Phi-4-Mini etc.
+        # Live cache tracking — allows sparse_v_threshold to be updated
+        # mid-conversation when the memory tier changes.
+        self._active_caches: list[TurboQuantKVCache] = []
+        self._caches_lock = threading.Lock()
 
     def load(
         self,
@@ -114,8 +119,9 @@ class ModelState:
         _ = self.model(warm_tokens, cache=warm_cache)
         mx.metal.clear_cache()
 
-        # Start memory pressure monitor singleton (no-op if already running).
-        start_monitor()
+        # Start memory pressure monitor and register tier-change callback.
+        ctrl = start_monitor()
+        ctrl.register_callback(self._on_tier_change)
         logger.info("Models ready. Memory pressure monitor started.")
         self.ready = True
 
@@ -141,7 +147,41 @@ class ModelState:
             self.model,
             bits=tier.bits,
             bits_v=tier.bits_v,
+            sparse_v_threshold=tier.sparse_v_threshold,
+            min_fused_context=tier.min_fused_context,
             boundary_layers=self.boundary_layers,
+        )
+
+    def register_caches(self, cache_list: list) -> None:
+        """Track TurboQuantKVCache instances from an active request."""
+        tqk = [c for c in cache_list if isinstance(c, TurboQuantKVCache)]
+        if tqk:
+            with self._caches_lock:
+                self._active_caches.extend(tqk)
+
+    def unregister_caches(self, cache_list: list) -> None:
+        """Remove caches for a completed/cancelled request."""
+        ids = {id(c) for c in cache_list if isinstance(c, TurboQuantKVCache)}
+        if ids:
+            with self._caches_lock:
+                self._active_caches = [c for c in self._active_caches
+                                       if id(c) not in ids]
+
+    def _on_tier_change(self, tier: QuantTier) -> None:
+        """Callback fired by the monitor when the tier changes.
+
+        Updates sparse_v_threshold on all in-flight TurboQuantKVCache instances
+        so the new threshold takes effect immediately — no need to restart the
+        request.  bits/bits_v cannot be changed on existing caches; new requests
+        pick up the new bit width via make_cache().
+        """
+        with self._caches_lock:
+            count = len(self._active_caches)
+            for cache in self._active_caches:
+                cache.sparse_v_threshold = tier.sparse_v_threshold
+        logger.info(
+            "[ModelState] Tier → %s: updated sparse_v_threshold=%.2e on %d cache(s)",
+            tier.name, tier.sparse_v_threshold, count,
         )
 
     @property
@@ -178,10 +218,15 @@ def create_app(state: Optional[ModelState] = None) -> FastAPI:
     @app.get("/memory_tier")
     def memory_tier():
         tier = get_controller().tier
+        with _state._caches_lock:
+            active_count = len(_state._active_caches)
         return {
             "tier": get_controller().tier_name,
             "bits_k": tier.bits,
             "bits_v": tier.bits_v,
+            "sparse_v_threshold": tier.sparse_v_threshold,
+            "min_fused_context": tier.min_fused_context,
+            "active_caches": active_count,
             "pq_compatible": _state._pq_compatible,
         }
 
@@ -262,6 +307,7 @@ async def _stream_response(
     yield _sse_chunk(request_id, model_name, created, delta={"role": "assistant"})
 
     main_cache, gen_kwargs = _build_gen_kwargs(request)
+    _state.register_caches(main_cache)
     stop_seqs = request.stop or []
     finish_reason = None
     loop = asyncio.get_event_loop()
@@ -274,7 +320,10 @@ async def _stream_response(
             **gen_kwargs,
         ))
 
-    responses = await loop.run_in_executor(None, _generate)
+    try:
+        responses = await loop.run_in_executor(None, _generate)
+    finally:
+        _state.unregister_caches(main_cache)
 
     for resp in responses:
         if resp.text:
@@ -305,6 +354,7 @@ async def _non_stream_response(
     request: ChatCompletionRequest,
 ) -> JSONResponse:
     main_cache, gen_kwargs = _build_gen_kwargs(request)
+    _state.register_caches(main_cache)
     loop = asyncio.get_event_loop()
 
     def _generate():
@@ -324,7 +374,10 @@ async def _non_stream_response(
             last = resp
         return "".join(pieces), finish, last
 
-    content, finish_reason, last_resp = await loop.run_in_executor(None, _generate)
+    try:
+        content, finish_reason, last_resp = await loop.run_in_executor(None, _generate)
+    finally:
+        _state.unregister_caches(main_cache)
 
     prompt_tokens = last_resp.prompt_tokens if last_resp else 0
     gen_tokens = last_resp.generation_tokens if last_resp else 0
@@ -352,6 +405,7 @@ async def _non_stream_response(
             "memory_tier": _state.current_tier,
             "bits_k": tier.bits,
             "bits_v": tier.bits_v,
+            "sparse_v_threshold": tier.sparse_v_threshold,
             "speculative": _state.draft_model is not None,
         },
     })

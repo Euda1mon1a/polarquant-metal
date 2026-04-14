@@ -18,7 +18,7 @@ import threading
 import time
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -26,16 +26,23 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class QuantTier:
     name: str
-    bits: Optional[int]    # None = FP16 (no compression)
-    bits_v: Optional[int]  # V cache bits — None = same as bits
+    bits: Optional[int]          # None = FP16 (no compression)
+    bits_v: Optional[int]        # V cache bits — None = same as bits
+    sparse_v_threshold: float    # 0.0 = disabled; >0 prunes near-zero V positions
+    min_fused_context: int       # minimum L_kv before fused Metal kernels activate
 
 
-# K is more sensitive than V per TurboQuant paper.
-# Under pressure, keep V at 4-bit even when K drops to 3-bit.
+# Tier philosophy:
+#   normal   — FP16, no compression, maximum quality.  Use when memory is free.
+#   warn     — 4-bit asymmetric, light sparsity.  ~4x KV memory reduction.
+#   critical — 3-bit K / 4-bit V, moderate sparsity.  ~5x reduction.
+#
+# sparse_v_threshold and min_fused_context are PLACEHOLDER values.
+# Tune on Mini with 35B model using bench_sv_simd.py + quality eval.
 TIERS: dict[str, QuantTier] = {
-    "normal":   QuantTier("normal",   bits=None, bits_v=None),
-    "warn":     QuantTier("warn",     bits=4,    bits_v=4),
-    "critical": QuantTier("critical", bits=3,    bits_v=4),
+    "normal":   QuantTier("normal",   bits=None, bits_v=None, sparse_v_threshold=0.0,  min_fused_context=512),
+    "warn":     QuantTier("warn",     bits=4,    bits_v=4,    sparse_v_threshold=1e-4, min_fused_context=512),
+    "critical": QuantTier("critical", bits=3,    bits_v=4,    sparse_v_threshold=1e-3, min_fused_context=256),
 }
 
 TIER_SEVERITY: dict[str, int] = {"normal": 0, "warn": 1, "critical": 2}
@@ -86,6 +93,7 @@ class AdaptiveTierController:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        self._callbacks: list[Callable[[QuantTier], None]] = []
 
     def start(self) -> None:
         """Start the background polling thread. No-op if already running."""
@@ -103,6 +111,16 @@ class AdaptiveTierController:
         """Signal the background thread to exit on its next poll cycle."""
         self._running = False
 
+    def register_callback(self, fn: Callable[[QuantTier], None]) -> None:
+        """Register a function called whenever the tier changes.
+
+        Called with the new QuantTier as the sole argument.  Fired outside
+        the internal lock, so callbacks may safely call back into this object.
+        Safe to register before or after start().
+        """
+        with self._lock:
+            self._callbacks.append(fn)
+
     def _run(self) -> None:
         while self._running:
             self._maybe_update(get_memory_pressure())
@@ -110,6 +128,9 @@ class AdaptiveTierController:
 
     def _maybe_update(self, observed: str) -> None:
         now = time.monotonic()
+        fired_tier: Optional[QuantTier] = None
+        callbacks: list[Callable[[QuantTier], None]] = []
+
         with self._lock:
             if observed == self._current:
                 return
@@ -119,6 +140,16 @@ class AdaptiveTierController:
                 logger.info("[MemPressure] %s → %s", self._current, observed)
                 self._current = observed
                 self._last_change = now
+                fired_tier = TIERS[observed]
+                callbacks = list(self._callbacks)  # snapshot while holding lock
+
+        # Fire callbacks outside the lock to avoid deadlocks
+        if fired_tier is not None:
+            for fn in callbacks:
+                try:
+                    fn(fired_tier)
+                except Exception as exc:
+                    logger.warning("[MemPressure] Tier callback raised: %s", exc)
 
     @property
     def tier(self) -> QuantTier:
@@ -133,13 +164,21 @@ class AdaptiveTierController:
             return self._current
 
     def force_tier(self, name: str) -> None:
-        """Override the current tier. Intended for testing only."""
+        """Override the current tier. Intended for testing only. Fires callbacks."""
         if name not in TIERS:
             raise ValueError(f"Unknown tier: {name!r}. Must be one of {list(TIERS)}")
+        callbacks: list[Callable[[QuantTier], None]] = []
         with self._lock:
             logger.warning("[MemPressure] Tier force-set to %r (testing only)", name)
             self._current = name
             self._last_change = time.monotonic()
+            callbacks = list(self._callbacks)
+        new_tier = TIERS[name]
+        for fn in callbacks:
+            try:
+                fn(new_tier)
+            except Exception as exc:
+                logger.warning("[MemPressure] Tier callback raised: %s", exc)
 
 
 # ---------------------------------------------------------------------------
