@@ -1,4 +1,10 @@
-"""OpenAI-compatible serving for 72B models with PolarQuant + speculative decoding."""
+"""
+DEPRECATED: The serving layer has moved to the `polarquant-serving` package.
+    pip install polarquant-serving
+    python -m polarquant_serving.server --model ...
+
+This copy is kept for backward compatibility.
+"""
 
 from .server import create_app, serve
 

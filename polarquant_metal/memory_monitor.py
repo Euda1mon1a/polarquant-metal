@@ -1,4 +1,11 @@
 """
+DEPRECATED: This module has moved to the `polarquant-serving` package.
+    pip install polarquant-serving
+    from polarquant_serving.memory_monitor import ...
+
+This copy is kept temporarily for backward compatibility with the Mini
+LaunchAgent that imports from `polarquant_metal.memory_monitor`.
+
 Adaptive memory pressure monitor for PolarQuant Metal server.
 
 Polls vm.memory_pressure on a daemon thread and maintains a tier with

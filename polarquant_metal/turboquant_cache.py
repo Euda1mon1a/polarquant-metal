@@ -60,7 +60,8 @@ class TurboQuantKVCache:
 
     def __init__(self, bits: int = 3, bits_v: int = None, fused: bool = True,
                  min_fused_context: int = 512, sparse_v_threshold: float = 1e-3,
-                 system_prompt_len: int = 0, recent_zone_len: int = 0):
+                 system_prompt_len: int = 0, recent_zone_len: int = 0,
+                 use_simd: bool = True):
         if bits not in (2, 3, 4):
             raise ValueError(f"bits must be 2, 3, or 4, got {bits}")
         self.turbo_bits = bits  # K bits (also used as default for V)
@@ -69,6 +70,7 @@ class TurboQuantKVCache:
         self._fused = fused
         self.min_fused_context = min_fused_context
         self.sparse_v_threshold = sparse_v_threshold
+        self._use_simd = use_simd
 
         self._head_dim = None
         self._key_pq = None
@@ -444,6 +446,7 @@ class TurboQuantKVCache:
                 count_and_indices, wn, v_packed,
                 self._value_centroids_f32,
                 self._head_dim, L_kv, self._bits_v,
+                use_simd=self._use_simd,
             )
         else:
             # Dense fallback (Phase 2 kernel)
@@ -455,6 +458,7 @@ class TurboQuantKVCache:
                 head_dim=self._head_dim,
                 bits=self._bits_v,
                 sparse_v_threshold=adaptive_threshold,
+                use_simd=self._use_simd,
             )
 
         # Inverse rotation from value basis
