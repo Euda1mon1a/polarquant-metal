@@ -86,7 +86,39 @@ Root cause: NOT a kernel bug. The naive dequant path produces identical attentio
 
 This matches rachittshah's PR #1059 findings: "Some models degrade below 4-bit (Qwen3-1.7B drops at 3-bit). Recommend 4-bit as default."
 
-### Qwen3.5-35B-A3B-4bit — WORKS (hybrid cache)
+### Qwen3.5-35B-A3B-4bit — NOT BENEFICIAL (hybrid architecture)
+
+End-to-end sweep (1K-16K, 64 decode tokens, M4 Pro Mini 64GB, 2026-04-13):
+
+| Context | FP16 tok/s | PQ4 tok/s | PQ3 tok/s | PQ4/FP16 | KV (FP16) | KV (PQ4) | Cmpr |
+|---------|-----------|----------|----------|---------|----------|---------|------|
+| 1,024 | 92.8 | 25.6 | 26.3 | 0.28x | ~9.6 MB | ~2.4 MB | 3.9x |
+| 4,096 | 87.3 | 24.3 | 24.5 | 0.28x | ~48.6 MB | ~12.3 MB | 3.9x |
+| 8,192 | 83.1 | 22.5 | 23.6 | 0.27x | ~96.6 MB | ~24.5 MB | 3.9x |
+| 16,384 | 74.6 | 20.9 | 21.4 | 0.28x | ~192.6 MB | ~48.9 MB | 3.9x |
+
+**Conclusion:** PolarQuant is ~3.5x slower than FP16 at all context lengths.
+
+Root cause: Qwen3.5-35B-A3B is a **hybrid MoE** — 30/40 layers are linear attention
+(`GatedDeltaNet`, `ArraysCache`). PolarQuant only operates on the 10 standard attention
+layers. At 16K context those 10 layers contribute ~192 MB of KV cache, while the model
+weights are ~20 GB — a 100:1 ratio. The bottleneck is model weight bandwidth, not KV
+cache bandwidth. Compressing 192 MB adds kernel dispatch overhead without reducing the
+real bottleneck.
+
+Signature: FP16 tok/s drops only 18 tok/s from 1K→16K (weight-dominated profile).
+A KV-cache-dominated model would drop far more steeply.
+
+**Rule:** PolarQuant is beneficial for **dense** 35B+ models where all (or most) layers
+use standard attention and the KV cache grows to multiple GB at long context.
+MoE/hybrid models with few standard attention layers (like Qwen3.5-35B-A3B) are
+weight-bandwidth-dominated regardless of context length.
+
+**Next target:** Gemma 4 31B (dense) — all standard attention layers, no linear bypass.
+At 32K context, KV cache would be 4–8 GB FP16 → dominant bottleneck → PolarQuant pays off.
+See "Gemma 4 — Potential Future Targets" section in project memory.
+
+### Qwen3.5-35B-A3B-4bit — WORKS (hybrid cache — correctness only)
 
 Qwen3.5 uses hybrid attention: 30 linear layers (`GatedDeltaNet` with `ArraysCache`) + 10 standard attention layers (`Qwen3NextAttention` with `KVCache`). `make_fused_cache()` now detects `is_linear` and only replaces standard attention layers with `TurboQuantKVCache`.
 
@@ -186,6 +218,21 @@ of the precombined-dense and compact-index-sparse SV kernels respectively.
 | 8192 | 0.79 ms | 0.23 ms | 0.18 ms | 0.15 ms | 3.52x | 1.15x | 1.000000 |
 | 16384 | 1.12 ms | 0.27 ms | 0.21 ms | 0.16 ms | 4.11x | 1.34x | 1.000000 |
 | 32768 | 2.03 ms | 0.35 ms | 0.26 ms | 0.16 ms | **5.76x** | 1.56x | 1.000000 |
+
+**Benchmark results (M4 Pro Mini, 64GB, 2026-04-13):**
+
+| L_kv | scalar_dense | simd_dense | scalar_sparse | simd_sparse | spd_dense | spd_sparse | cos_sim |
+|------|-------------|-----------|--------------|------------|----------|-----------|---------|
+| 2048 | 1.04 ms | 0.21 ms | 0.17 ms | 0.14 ms | **5.00x** | 1.16x | 1.000000 |
+| 4096 | 0.49 ms | 0.17 ms | 0.14 ms | 0.13 ms | 2.88x | 1.04x | 1.000000 |
+| 8192 | 0.73 ms | 0.21 ms | 0.17 ms | 0.14 ms | 3.49x | 1.23x | 1.000000 |
+| 16384 | 1.27 ms | 0.26 ms | 0.20 ms | 0.15 ms | 4.87x | 1.34x | 1.000000 |
+| 32768 | 2.38 ms | 0.36 ms | 0.25 ms | 0.16 ms | **6.54x** | 1.61x | 1.000000 |
+
+M4 Pro shows higher speedup ratios than M5 Max (6.54x vs 5.76x at 32K) because the lower
+memory bandwidth makes the scalar path slower, widening the gap. Simdgroup absolute times
+are nearly identical across chips (~0.35–0.36 ms at 32K) — the kernel is compute-bound once
+simdgroup reduction is applied, making it largely portable across M-series.
 
 Active positions per head: ~1% of L_kv (concentrated attention pattern).
 
