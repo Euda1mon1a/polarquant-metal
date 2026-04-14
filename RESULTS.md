@@ -177,8 +177,27 @@ of the precombined-dense and compact-index-sparse SV kernels respectively.
 - Sparse: parallelizes the count loop — most impactful at L_kv ≥ 8K (count ≥ 80)
 - Prefill (L_q > 1) is now also accelerated via the dense simd path
 
-**Benchmark:** run `python benchmarks/bench_sv_simd.py` on Mini with 35B loaded
-(needs 35B for memory-bandwidth-bound regime where effect is largest).
+**Benchmark results (M5 Max MBP, 2026-04-13):**
+
+| L_kv | scalar_dense | simd_dense | scalar_sparse | simd_sparse | spd_dense | spd_sparse | cos_sim |
+|------|-------------|-----------|--------------|------------|----------|-----------|---------|
+| 2048 | 0.83 ms | 0.18 ms | 0.25 ms | 0.17 ms | **4.52x** | 1.48x | 1.000000 |
+| 4096 | 0.44 ms | 0.20 ms | 0.18 ms | 0.16 ms | 2.24x | 1.12x | 1.000000 |
+| 8192 | 0.79 ms | 0.23 ms | 0.18 ms | 0.15 ms | 3.52x | 1.15x | 1.000000 |
+| 16384 | 1.12 ms | 0.27 ms | 0.21 ms | 0.16 ms | 4.11x | 1.34x | 1.000000 |
+| 32768 | 2.03 ms | 0.35 ms | 0.26 ms | 0.16 ms | **5.76x** | 1.56x | 1.000000 |
+
+Active positions per head: ~1% of L_kv (concentrated attention pattern).
+
+Key findings:
+- **Dense simd: 2.2–5.8x faster** than scalar. Strongest at 32K (5.76x). The dense path
+  is now the performance floor — even short contexts see 2x+ from better GPU occupancy.
+- **Sparse simd: 1.1–1.6x** over scalar sparse. Smaller gain because count (20–327 active
+  positions) is close to SIMD_SIZE=32, so most lanes handle only 0–10 iterations. Effect
+  will be larger at 35B with longer contexts and looser thresholds (count > 100).
+- **Correctness: perfect** (cosine similarity = 1.000000 at all context lengths).
+- M5 Max absolute times are ~2x faster than M4 Pro (different memory bandwidth).
+  Run `bench_sv_simd.py` on Mini to get M4 Pro numbers for RESULTS.md.
 
 **Validation:** `kernels/polarquant_sv_simd.metal` added; all 4 kernels compile
 clean via `xcrun metal` on macOS 26.4.

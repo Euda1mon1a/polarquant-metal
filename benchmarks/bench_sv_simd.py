@@ -24,7 +24,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import mlx.core as mx
 
-from polarquant_metal.polar_quant import PolarQuant
 from polarquant_metal.packing import pack_indices
 from polarquant_metal.codebooks import load_codebook_f32
 from polarquant_metal.kernels import (
@@ -86,18 +85,13 @@ def bench(fn, warmup=WARMUP, n=N_TRIALS):
 
 def make_inputs(L_kv: int, rng: np.random.Generator):
     """Build synthetic quantized V cache + concentrated softmax weights."""
-    pq = PolarQuant(bits=BITS, dim=D)
-    raw_v = rng.standard_normal((B, N_KV_HEADS, L_kv, D)).astype(np.float32)
-    v_indices_list = []
-    for b in range(B):
-        for h in range(N_KV_HEADS):
-            ids = pq.quantize(raw_v[b, h])
-            v_indices_list.append(ids)
-    v_indices_np = np.stack(v_indices_list).reshape(B, N_KV_HEADS, L_kv, D)
+    # Use random indices directly — perf benchmark, exact values don't matter
+    n_levels = 1 << BITS
+    v_indices_np = rng.integers(0, n_levels, size=(B, N_KV_HEADS, L_kv, D), dtype=np.uint32)
     v_packed = pack_indices(
-        mx.array(v_indices_np, dtype=mx.uint32), bits=BITS, dim=D
+        mx.array(v_indices_np, dtype=mx.uint8), bits=BITS
     )
-    v_centroids = load_codebook_f32(bits=BITS)
+    v_centroids = load_codebook_f32(bits=BITS, dim=D)
 
     # Concentrated attention weights — most mass on ~1% of positions
     raw_w = rng.standard_normal((B, N_HEADS, 1, L_kv)).astype(np.float32) * 0.1
