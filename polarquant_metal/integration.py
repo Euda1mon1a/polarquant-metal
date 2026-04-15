@@ -29,10 +29,16 @@ def _make_patched_sdpa(original_sdpa):
         # 2. Context >= min_fused_context — overhead doesn't pay off below this
         if hasattr(cache, "turbo_bits") and cache._fused:
             L_q = queries.shape[2]
-            if L_q == 1 and cache.offset >= cache.min_fused_context:
-                return cache.fused_sdpa(queries, scale=scale, mask=mask)
-            # During prefill (L_q > 1) with quantized cache, update_and_fetch
-            # returns packed stubs. Dequantize for standard SDPA.
+            if L_q == 1:
+                # First decode step: bulk-quantize accumulated FP16 prefill tokens.
+                # This is the lazy-prefill path — FP16 is held through all prefill
+                # chunks, then compressed in one shot here. O(N) prefill, not O(N²).
+                if not cache._quantized and cache._fp16_keys is not None:
+                    cache._bulk_quantize()
+                if cache.offset >= cache.min_fused_context:
+                    return cache.fused_sdpa(queries, scale=scale, mask=mask)
+            # Prefill path: cache is FP16 (lazy mode) — keys/values are already
+            # correct FP16 arrays, no dequantize needed. Fall through to standard SDPA.
             if cache._quantized:
                 keys = cache.keys
                 values = cache.values

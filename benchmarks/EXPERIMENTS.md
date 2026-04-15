@@ -24,6 +24,42 @@ on Apple Silicon.
 | 7 | Blast radius zones | `resilience/blast_radius.py` | Fault isolation | See EXP7_RESULTS.md |
 | 8 | SPC/Western Electric quality | `resilience/spc.py` | Quality monitoring | See EXP8_RESULTS.md |
 | 9 | Erlang workload prediction | `queuing/erlang_c.py` | SV kernel dispatch | **Partial (accurate but too costly)** |
+| 10 | **Lazy prefill** | Engineering fix | Prefill O(N²) overhead | **NEXT — priority** |
+
+---
+
+## Experiment 10: Lazy Prefill (FP16 Through Entire Prefill)
+
+**Status:** Implemented, pending benchmark on Mini (2026-04-15)
+
+**Problem:** Chunked prefill with quantized KV is O(N²). Current code bulk-quantizes
+FP16→PQ at `min_fused_context=512` tokens. Every subsequent prefill chunk must
+dequantize all prior PQ tokens for standard SDPA. At 64K context: >112 min, killed.
+
+**Root cause identified empirically (2026-04-15):** 64K prefill with PQ ran >112 min
+on M5 Max MBP (128GB). FP16 baseline: ~2 min. Ratio: >56x. The threshold mismatch
+(trigger at 512 tokens, not at end of prefill) is the cause.
+
+**Fix (two changes, minimal):**
+
+1. `turboquant_cache.py` — Remove mid-prefill bulk-quantize trigger:
+   - Before: `if self.offset >= self.min_fused_context: self._bulk_quantize()`
+   - After: FP16 storage accumulates through entire prefill, no trigger
+
+2. `integration.py` — Trigger bulk-quantize at first decode step:
+   - Before: no such logic
+   - After: `if L_q == 1 and not cache._quantized and cache._fp16_keys is not None: cache._bulk_quantize()`
+
+**Expected outcome:**
+- Prefill: O(N) — FP16 SDPA throughout, no dequantize step
+- First decode step: one-shot bulk-quantize (adds ~0.5s, amortized over generation)
+- Decode tps: unchanged (same fused PQ SDPA path as before)
+- 64K prefill: ~2-3 min vs >112 min (>50x improvement)
+
+**Benchmark:** `benchmarks/exp10_lazy_prefill.py`
+- Measures prefill time + decode tps at 8K / 32K / 64K
+- Runs FP16 baseline and PQ-lazy back-to-back
+- Target: Mini (Qwen3.5-35B-A3B-4bit, M4 Pro 64GB)
 
 ---
 

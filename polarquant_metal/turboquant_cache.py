@@ -179,15 +179,9 @@ class TurboQuantKVCache:
                     [self._fp16_values, values], axis=2)
             self.offset += S
 
-            if self.offset >= self.min_fused_context:
-                self._bulk_quantize()
-                # After bulk quantize, fp16 storage is freed — return packed
-                # stubs so patched SDPA routes to fused_sdpa()
-                return (
-                    self._k_packed[..., :self.offset, :],
-                    self._v_packed[..., :self.offset, :],
-                )
-
+            # Stay FP16 through entire prefill — bulk_quantize() is triggered
+            # by patched SDPA at the first decode step (L_q == 1), not here.
+            # This eliminates the O(N²) dequantize overhead during chunked prefill.
             return self._fp16_keys, self._fp16_values
 
         # Quantized mode: compress and store
