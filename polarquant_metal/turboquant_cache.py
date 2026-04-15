@@ -61,7 +61,7 @@ class TurboQuantKVCache:
     def __init__(self, bits: int = 3, bits_v: int = None, fused: bool = True,
                  min_fused_context: int = 512, sparse_v_threshold: float = 1e-3,
                  system_prompt_len: int = 0, recent_zone_len: int = 0,
-                 use_simd: bool = True):
+                 use_simd: bool = True, rigidity_threshold: float = 0.0):
         if bits not in (2, 3, 4):
             raise ValueError(f"bits must be 2, 3, or 4, got {bits}")
         self.turbo_bits = bits  # K bits (also used as default for V)
@@ -96,7 +96,7 @@ class TurboQuantKVCache:
         self._prev_v_packed = None
         self._prev_k_unit_rotated = None  # for cheap cosine comparison
         self._prev_v_unit_rotated = None
-        self.rigidity_threshold = 0.90  # cosine sim threshold for index reuse
+        self.rigidity_threshold = rigidity_threshold  # 0.0 disables gate (default); >0 enables index reuse
         self._rigidity_skips = 0
         self._rigidity_total = 0
 

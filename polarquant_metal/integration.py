@@ -147,7 +147,8 @@ def make_fused_cache(model, bits: int = 3, bits_v: int = None,
                      boundary_layers: int = 2,
                      min_fused_context: int = 512,
                      sparse_v_threshold: float = 1e-3,
-                     use_simd: bool = True) -> list:
+                     use_simd: bool = True,
+                     rigidity_threshold: float = 0.0) -> list:
     """Create cache instances for each layer and patch SDPA.
 
     Supports three model architectures:
@@ -176,7 +177,8 @@ def make_fused_cache(model, bits: int = 3, bits_v: int = None,
 
     if _is_gemma4(model):
         return _make_gemma4_cache(model, bits, bits_v, boundary_layers,
-                                  min_fused_context, sparse_v_threshold, use_simd)
+                                  min_fused_context, sparse_v_threshold, use_simd,
+                                  rigidity_threshold)
 
     # --- Original path: Qwen3.5 / standard models ---
 
@@ -201,13 +203,14 @@ def make_fused_cache(model, bits: int = 3, bits_v: int = None,
             caches.append(TurboQuantKVCache(bits=bits, bits_v=bits_v, fused=True,
                                             min_fused_context=min_fused_context,
                                             sparse_v_threshold=sparse_v_threshold,
-                                            use_simd=use_simd))
+                                            use_simd=use_simd,
+                                            rigidity_threshold=rigidity_threshold))
     return caches
 
 
 def _make_gemma4_cache(model, bits, bits_v, boundary_layers,
                        min_fused_context, sparse_v_threshold: float = 1e-3,
-                       use_simd: bool = True) -> list:
+                       use_simd: bool = True, rigidity_threshold: float = 0.0) -> list:
     """Create PolarQuant cache for Gemma 4 architecture.
 
     Gemma 4 has three layer types requiring different cache strategies:
@@ -284,6 +287,7 @@ def _make_gemma4_cache(model, bits, bits_v, boundary_layers,
                 min_fused_context=min_fused_context,
                 sparse_v_threshold=sparse_v_threshold,
                 use_simd=use_simd,
+                rigidity_threshold=rigidity_threshold,
             ))
             pq_count += 1
         else:

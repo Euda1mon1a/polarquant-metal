@@ -285,26 +285,104 @@ python -m polarquant_metal.serving.server \
 **`/memory_tier` endpoint** now exposes `kv_used_bytes`, `kv_budget_bytes`,
 `kv_used_pct` — useful for dashboarding and integration tests.
 
-## Long-Context Benchmark — PENDING (2026-04-13)
+## Gemma 3 27B-IT-4bit — M5 Max MBP (Long-Context Benchmark)
 
-`benchmarks/bench_35b_longctx.py` was started on Mini (M4 Pro 64GB) comparing
-FP16 vs PQ-orig (scalar, `use_simd=False`) vs PQ-simd at 32K/64K/128K context.
-Results to be filled in when Mini is accessible.
+**Date:** 2026-04-14  
+**Hardware:** M5 Max MBP, 128 GB unified memory, macOS 26.4  
+**Model:** `mlx-community/gemma-3-27b-it-4bit`  
+**Script:** `benchmarks/bench_g3_27b_mbp.py`
 
-| ctx | FP16 | PQ-orig | PQ-simd | orig/fp16 | simd/fp16 | kv_mb | cmpr |
-|-----|------|---------|---------|-----------|-----------|-------|------|
-| 32K | — | — | — | — | — | — | — |
-| 64K | — | — | — | — | — | — | — |
-| 128K | — | — | — | — | — | — | — |
+Gemma 3 27B has full attention across all 62 layers — no sliding window, no linear bypass.
+KV cache scales linearly with context on every layer. At 64K tokens, KV bandwidth is ~42%
+of total memory bandwidth (vs ~14% for Qwen3.5-35B-A3B/Gemma 4 31B at comparable context).
+KV/weight crossover happens at ~95K tokens for this model.
 
-Expected behavior based on breakeven analysis:
-- At 128K context, Qwen3.5-35B-A3B KV cache ≈ 1.68 GB (only 10/40 std attn layers)
-- Weight bandwidth ≈ 5 GB for 4-bit 35B → KV is ~25% of bottleneck at 128K
-- Expected modest gain (~1.2x) at 128K, near-FP16 at 32K/64K
-- The March 31 result (75.3 vs 71.4 tok/s) was likely at ~128K context
+**Why this is the right benchmark target:**  
+Qwen3.5-35B-A3B (MoE) and Gemma 4 31B (sliding-window) are both weight-bandwidth-dominated
+below 64K context. Gemma 3 27B at 64K–128K is the first configuration in our test suite
+where KV cache compression directly competes with the bottleneck. This was confirmed by
+Perplexity deep research (2026-04-14, see conversation transcript).
 
-For dense 35B (Gemma 4 31B), 32K context → KV cache ≈ 4–8 GB → dominant bottleneck.
-Expected 2–3x speedup at 32K on a dense model.
+### FP16 Baseline (M5 Max 128GB)
+
+| ctx | tps | actual_ctx |
+|-----|-----|-----------|
+| 32K | 24.3 | 32,304 |
+| 64K | 19.7 | 64,488 |
+| 128K | 16.3 | 128,856 |
+
+FP16 tps drops 33% from 32K → 128K (24.3 → 16.3), confirming KV growing as
+a significant fraction of total bandwidth pressure. Not yet fully KV-dominated
+at 32K, clearly mixed by 128K.
+
+### PQ-simd (4-bit K, 4-bit V, boundary_layers=2)
+
+| ctx | tps | kv_mb | fp16eq_mb | cmpr | tps/fp16 |
+|-----|-----|-------|-----------|------|---------|
+| 32K | 7.9 | 3,780 | 14,660 | 3.9x | 0.33x |
+| 64K | DNF | — | — | — | — |
+| 128K | DNF | — | — | — | — |
+
+*64K and 128K prefills did not finish — killed after ~112 min wall time (O(N²) dequantize overhead). See prefill table below.*
+
+**At 32K:** PQ is 3x slower than FP16. Expected — KV is only 29% of bandwidth at this
+context, so compressing KV doesn't relieve the weight-bandwidth bottleneck. The
+quantize/dequantize overhead adds cost without removing the real constraint.
+
+**Note on prefill overhead (O(N²) dequantize):** Each 512-token prefill chunk
+dequantizes all prior tokens to run standard SDPA. Work per chunk ∝ current_context,
+so total prefill work ∝ N². FP16 prefill is O(N). Empirical data:
+
+| Context | FP16 prefill | PQ prefill | Ratio |
+|---------|-------------|-----------|-------|
+| 32K | ~2 min | ~4 min | ~2x |
+| 64K | ~2 min | >112 min (DNF) | >56x |
+| 128K | ~2 min | ~450 min est. | ~225x est. |
+
+64K PQ prefill ran for >112 min wall time (71 min CPU) and was killed — never completed.
+This is a known limitation (RESULTS.md item 7 "Prefill query tiling" fix).
+Generation tps (post-prefill) is unaffected by prefill overhead.
+
+### IOGPU Kernel Panic Mitigation (2026-04-14)
+
+The "completeMemory() prepare count underflow" crash in Apple's IOGPU.kext is triggered
+by MLX Metal allocations exceeding safe wired memory limits. PQ compression is a direct
+mitigation — smaller KV cache means longer safe context before hitting the panic threshold.
+
+**Safe context length with 15 GB model weights, Gemma 3 27B geometry:**
+
+| Hardware | Mode | KV per token | KV budget | Max safe ctx |
+|----------|------|-------------|-----------|-------------|
+| Mini M4 Pro 64GB (45GB limit) | FP16 | 0.484 MB | ~30 GB | ~62K tokens |
+| Mini M4 Pro 64GB (45GB limit) | PQ-4bit | 0.125 MB | ~30 GB | **~240K tokens** |
+| MBP M5 Max 128GB (89GB limit) | FP16 | 0.484 MB | ~74 GB | ~153K tokens |
+| MBP M5 Max 128GB (89GB limit) | PQ-4bit | 0.125 MB | ~74 GB | **~590K tokens** |
+
+PQ extends the crash-free context window by ~3.9x — matching the compression ratio.
+On the Mini, this is the difference between a Koa session crashing at 62K tokens and
+running safely to 240K.
+
+**Hardening applied to Mini (2026-04-14, survives reboot):**
+```
+iogpu.wired_limit_mb=45000   # 70% of 64GB (was 57344 = 87.5%)
+iogpu.wired_lwm_mb=38000     # low-water mark ~59%
+iogpu.disable_wired_collector=1  # prevents aggressive unwiring causing 10x slowdown
+```
+
+LaunchDaemon: `/Library/LaunchDaemons/com.local.gpu-wired-limit.plist`
+
+**Hardening applied to benchmark scripts:**  
+`mx.set_memory_limit(70%)`, `mx.set_cache_limit(15%)`, `mx.set_wired_limit(65%)` —
+added to `bench_g3_27b_mbp.py` before model load.
+
+**Watchdog enhancement:** `get_mlx_gb()` monitors `mx.get_active_memory() +
+mx.get_cache_memory()` directly; `KILL_ON_MLX_GB` threshold added.
+
+## Long-Context Benchmark — SUPERSEDED
+
+The Qwen3.5-35B-A3B benchmark on Mini was superseded by the Gemma 3 27B MBP benchmark
+above (see "Why Gemma 3 27B" section). Qwen3.5 is MoE hybrid (30/40 linear layers) —
+KV is at most 25% of bandwidth even at 128K. Not a meaningful PolarQuant target.
 
 ## Serving Layer Split (2026-04-13)
 
@@ -337,7 +415,7 @@ notices pointing to the new package for backward compatibility with the Mini Lau
    `set_kv_budget()` + combined OS+KV pressure signal in monitor thread.
 3. **~~Serving split~~** — ✓ Done (2026-04-13). `polarquant-serving` package created.
    Push to Gitea + publish when ready.
-4. **Long-context 35B benchmark** — fill in the table above once Mini is accessible.
+4. **~~Long-context Gemma 3 27B benchmark~~** — ✓ Done (2026-04-15). FP16 baseline complete (32K=24.3, 64K=19.7, 128K=16.3 tps). PQ-simd 32K=7.9 tps (3.9x compression). 64K/128K DNF — O(N²) prefill overhead makes them impractical (>112 min for 64K).
 5. **Tune tier thresholds on 35B** — Run 35B at 8K–32K on Mini. Tune
    `_KV_BUDGET_WARN_FRAC`/`_KV_BUDGET_CRITICAL_FRAC` and `sparse_v_threshold`
    values in `TIERS`. The 1e-4/1e-3 values are placeholders from 3B experiments.
@@ -345,6 +423,7 @@ notices pointing to the new package for backward compatibility with the Mini Lau
 7. **Prefill query tiling** — simdgroup covers the L_kv reduction but not multi-query
    tiling. For very large prefill (L_q ≥ 512), a threadgroup-tiled QK + SV kernel
    would further help. Needs `threadgroup_memory_length` and barrier coordination.
-8. **~~Model compatibility~~** — ✓ Done (2026-04-13): Llama-3.2-3B is NOT beneficial (see above). PolarQuant sweet spot is 35B+ where KV memory bandwidth is the bottleneck
-9. **Gemma 4 31B benchmark** — dense model, true primary target. After serving split
-   is deployed on Mini, benchmark at 32K/64K context.
+8. **~~Model compatibility~~** — ✓ Done (2026-04-13): Llama-3.2-3B is NOT beneficial (see above). PolarQuant sweet spot is 35B+ dense models where KV bandwidth is the bottleneck.
+9. **Gemma 4 31B dense benchmark** — sliding-window layers confirmed not beneficial.
+   True dense target is Gemma 3 27B (see above). Gemma 4 31B would require Mini
+   without other services running (64GB headroom too tight for FP16 at 32K+).

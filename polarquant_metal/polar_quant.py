@@ -46,11 +46,12 @@ class PolarQuant:
         # Rotate to decorrelated basis
         rotated = unit @ self.rotation_t
 
-        # Quantize: find nearest centroid for each coordinate
-        inner_bounds = self.boundaries[1:-1]
-        indices = mx.zeros(rotated.shape, dtype=mx.uint8)
-        for i in range(self.n_levels - 1):
-            indices = indices + (rotated > inner_bounds[i]).astype(mx.uint8)
+        # Quantize: find nearest centroid for each coordinate.
+        # Vectorized broadcast: compare rotated [..., D] against boundaries [n_levels-1]
+        # by expanding to [..., D, n_levels-1], sum True comparisons → index in [0, n_levels-1].
+        # Replaces a Python for-loop (15 iterations at 4-bit) with one MLX op.
+        inner_bounds = self.boundaries[1:-1]  # shape (n_levels-1,)
+        indices = (rotated[..., None] > inner_bounds).sum(axis=-1).astype(mx.uint8)
 
         return indices, norms
 
