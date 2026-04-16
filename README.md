@@ -296,6 +296,15 @@ Novelty assessment grounded in [Perplexity deep research](https://huggingface.co
 
 **Result:** 75.3→81 tok/s on Qwen3.5-35B (vs 71.4 standard). Phase 3 SV kernel 5.6x faster at 32K. 9 cross-disciplinary experiments documented (4 wins, 4 negatives, 1 partial).
 
+### Related Concurrent Work
+
+Credit to the upstream PR and parallel efforts this project converges with:
+
+- **[ml-explore/mlx-lm PR #1059](https://github.com/ml-explore/mlx-lm/pull/1059)** — the PolarQuant KV cache PR we forked from. Provided the quantization primitive (random orthogonal rotation + Lloyd-Max codebook) that these fused Metal kernels operate on. Everything here is downstream of that work.
+- **[ericshwu/PolarQuant](https://github.com/ericshwu/PolarQuant)** — Wu et al., *Leveraging Polar Transformation for Key Cache Quantization and Decoding Acceleration*, NeurIPS 2025. The paper this project's name derives from. Implemented on NVIDIA A100/A800 via Triton. Uses polar transformation for Key cache specifically; distinct from the TurboQuant-style rotation + Lloyd-Max pipeline we port to Metal, but shares the spherical decomposition concept.
+- **[hilllief/polarquant-kv](https://github.com/hilllief/polarquant-kv)** — concurrent from-scratch CUDA re-implementation of TurboQuant (March 2026) with explicit K+V dual compression and a Beta-distribution-derived 16-centroid Lloyd-Max codebook. Reports cos-sim 0.990 at 4-bit on Qwen2.5-0.5B and integrates into llama.cpp via patch. Solves the same problem on a different stack; their codebook construction is a useful numerical comparison target.
+- **[jagmarques/nexusquant](https://github.com/jagmarques/nexusquant)** — alternative algorithmic family. Training-free KV cache compression via E8 lattice quantization + attention-scored token eviction + Hadamard rotation, on Triton/CUDA. Different quantization primitive (lattice vs. codebook) and different sparsity mechanism (permanent eviction vs. our sparse V). Useful benchmark reference for the low-bit regime; documents a sharp NIAH cliff at 35% eviction that motivates our NIAH roadmap item.
+
 ### Key References
 
 - [TurboQuant (arXiv:2504.19874)](https://arxiv.org/abs/2504.19874) -- Zandieh et al., ICLR 2026
@@ -313,6 +322,37 @@ Novelty assessment grounded in [Perplexity deep research](https://huggingface.co
 - [HIES](https://arxiv.org/abs/2410.10165) -- NeurIPS 2025 workshop, entropy-based head importance
 - [Entropy-Guided Attention (arXiv:2501.03489)](https://arxiv.org/abs/2501.03489) -- Jan 2025, headwise entropy regularization
 
+## Roadmap
+
+Priorities as of 2026-04-15, after the E2E Gemma-3-27B MBP benchmarks (see `RESULTS.md`).
+
+### P0 — Unblock long-context benchmarks
+
+- **True lazy prefill for 64K+ contexts.** The existing `min_fused_context` threshold keeps the cache FP16 until a token count is reached, but during a long prefill each 512-token chunk still dequantizes all prior tokens — O(N²) work. Gemma-3-27B at 64K was killed after 112 min wall time. Fix: hold FP16 for the entire prefill phase, batch-quantize all KV only at the first decode step (L_q=1). Prior art: [oMLX](https://github.com/jundot/omlx) and [mlx-lm PR #1067](https://github.com/ml-explore/mlx-lm/pull/1067) converged on the same pattern. Commit `1ce4dba` (Exp 10) is an in-progress attempt in this direction.
+
+### P1 — Quality measurement harness
+
+- **NIAH (Needle In A Haystack) benchmark.** Current quality data is tps + per-layer cosine similarity. Both can hide factual-recall damage — NexusQuant documents 100%→40% NIAH recall at only +0.82% PPL. Add NIAH curves per bit width on Gemma-3-27B and Qwen3.5-35B before claiming long contexts are safe.
+- **Per-layer cosine-similarity regression check** against a fixed input set. Fast pre-commit feedback loop; catches kernel regressions earlier than full E2E tps runs.
+
+### P2 — Codebook bake-off
+
+- **E8 lattice VQ** at 2/3-bit. 240-point optimal 8-dim sphere packing, fixed lookup table, no training needed. Drop-in alternative to the current Lloyd-Max codebook; measure on identical test data. Source: NexusQuant.
+- **Beta-distribution-derived Lloyd-Max 16-centroid** (from hilllief/polarquant-kv). Third data point in the codebook comparison — whichever variant wins on quality × bitrate becomes the default.
+- **Hadamard rotation preprocessing.** Spreads energy uniformly across head_dim; stacks with any codebook choice. Particularly relevant for non-power-of-2 or heterogeneous head dims (e.g. Gemma-4's 256/512 split).
+
+### P3 — New capabilities
+
+- **Multi-window scoring for sparse V.** NexusQuant shows this restores NIAH recall 40%→80% at the same prune rate. Integrates with the existing Phase 3 compact-index kernel.
+- **Graduated boundary layer bit profile.** First/last ~15% of layers at higher precision; middle stays aggressive. Small but consistent quality win on architectures with sensitive boundary layers (Qwen family, 1–2 KV head models).
+
+### Explicitly not planned
+
+- **llama.cpp integration** — hilllief/polarquant-kv already covers that stack; splitting focus hurts MLX-native depth.
+- **Low-bit quantization on small models** — 3B is already 4× slower than FP16 at 3-bit. Target regime stays ≥27B where KV bandwidth dominates compute.
+- **Delta + zstd entropy coding** — only valuable for KV swap/offload. Our adaptive memory tier design keeps hot cache resident, so the compute cost buys nothing.
+- **Token eviction as a primary mechanism** — sparse V at attention time is a strictly better axis; permanent eviction damages NIAH recall (see NexusQuant).
+
 ## License
 
 MIT
@@ -326,3 +366,7 @@ MIT
 - [MLX Custom Metal Kernels](https://ml-explore.github.io/mlx/build/html/dev/custom_metal_kernels.html) — MLX kernel API docs
 - [QuaRot (arXiv:2404.00456)](https://arxiv.org/abs/2404.00456) — NeurIPS 2024, rotation-based outlier elimination
 - [Interactive benchmarks & novelty assessment](https://huggingface.co/spaces/3ud41mon14/polarquant-metal) — HuggingFace Space
+- [PolarQuant (NeurIPS 2025)](https://github.com/ericshwu/PolarQuant) — Wu et al., polar transformation for Key cache quantization
+- [ml-explore/mlx-lm PR #1059](https://github.com/ml-explore/mlx-lm/pull/1059) — upstream PolarQuant PR this project forked from
+- [hilllief/polarquant-kv](https://github.com/hilllief/polarquant-kv) — concurrent CUDA K+V implementation with Lloyd-Max codebook
+- [jagmarques/nexusquant](https://github.com/jagmarques/nexusquant) — E8 lattice quantization + attention-scored eviction alternative
